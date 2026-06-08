@@ -62,7 +62,7 @@ SEGMENT_CODE_MAP: dict[str, str] = {
 # Returns (pitch_segments, suggest_segments) for a given max_price in lakhs.
 # When budget is 0 (unspecified) the bot pitches everything — no split.
 # ─────────────────────────────────────────────────────────────────────────────
-def get_budget_pitch_suggest_segments(
+async def get_budget_pitch_suggest_segments(
     max_price_lakhs: float,
 ) -> tuple[list[str], list[str]]:
     if max_price_lakhs <= 0:
@@ -86,7 +86,7 @@ def get_budget_pitch_suggest_segments(
 # ─────────────────────────────────────────────────────────────────────────────
 # SEGMENT LOOKUP HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-def _segment_from_price_body(price_rupees: float, body_type: str) -> str:
+async def _segment_from_price_body(price_rupees: float, body_type: str) -> str:
     """
     Fallback segment code for cars not covered by SIMILAR_CARS.
     Uses price (in rupees) + body_type from the API response.
@@ -125,7 +125,7 @@ def _segment_from_price_body(price_rupees: float, body_type: str) -> str:
     return "d1"
 
 
-def get_car_segment(
+async def get_car_segment(
     make: str,
     model: str,
     price_rupees: float,
@@ -147,7 +147,7 @@ def get_car_segment(
     for key, row in similar_cars_dict.items():
         if key.casefold() == needle:
             return SEGMENT_CODE_MAP.get(row.get("Segment", ""), None) or \
-                   _segment_from_price_body(price_rupees, body_type)
+                   await _segment_from_price_body(price_rupees, body_type)
 
     # 2. fuzzy
     match = process.extractOne(
@@ -164,13 +164,13 @@ def get_car_segment(
             return code
 
     # 3. fallback
-    return _segment_from_price_body(price_rupees, body_type)
+    return await _segment_from_price_body(price_rupees, body_type)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PITCH / SUGGEST SPLITTER
 # ─────────────────────────────────────────────────────────────────────────────
-def split_cars_by_role(
+async def split_cars_by_role(
     cars: list[dict],
     pitch_segments: list[str],
     suggest_segments: list[str],
@@ -468,7 +468,7 @@ async def get_cars_according_to_user_specifications(
     max_price_lakhs = (
         max_price * 100_000 / 100_000 if max_price >= 10_000 else max_price
     )
-    pitch_segments, suggest_segments = get_budget_pitch_suggest_segments(max_price_lakhs)
+    pitch_segments, suggest_segments = await get_budget_pitch_suggest_segments(max_price_lakhs)
 
     async def return_cars(
         ctx: RunContext,
@@ -731,7 +731,7 @@ async def get_cars_according_to_user_specifications(
                 # ── Segment assignment ──────────────────────────────────
                 car_make_raw = car.get("make", "")
                 car_model_raw = car.get("model", "")
-                car_segment = get_car_segment(
+                car_segment = await get_car_segment(
                     make=car_make_raw,
                     model=car_model_raw,
                     price_rupees=price_raw,
@@ -833,7 +833,7 @@ async def get_cars_according_to_user_specifications(
                 )
 
             # ── Segment split for this result set ──────────────────────
-            cars_to_pitch, cars_to_suggest = split_cars_by_role(
+            cars_to_pitch, cars_to_suggest = await split_cars_by_role(
                 final_result, pitch_segments, suggest_segments
             )
             # ───────────────────────────────────────────────────────────
@@ -1018,7 +1018,7 @@ async def get_cars_according_to_user_specifications(
             all_data   = basic_primary_result.get("data", []) + nearest_hubs_primary_result.get("data", [])
             unique_data = list({item.get("car_lead_id"): item for item in all_data}.values())
             # Re-split after merging so pitch/suggest counts are accurate
-            merged_pitch, merged_suggest = split_cars_by_role(unique_data, pitch_segments, suggest_segments)
+            merged_pitch, merged_suggest = await split_cars_by_role(unique_data, pitch_segments, suggest_segments)
             primary_result = {
                 **basic_primary_result,
                 "data":            unique_data,
