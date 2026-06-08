@@ -1,267 +1,197 @@
-"""
-get_cars_according_to_user_specifications
-==========================================
-Voice-bot car-search function with segment-wise pitch/suggest bifurcation.
-
-Segment codes (Indian used-car market):
-    a1  Entry Hatchback        Alto, Kwid, Eon               ≤ ₹3.5 L
-    a2  Budget/Premium Hatch   Swift, Baleno, i20, Wagon R    ₹3–8 L
-    b1  Compact Sedan / Micro SUV / Compact MUV
-                               Dzire, Punch, Kiger, Ertiga    ₹5–11 L
-    b2  Mid Sedan / Compact SUV / Utility SUV
-                               City, Nexon, Brezza, Venue     ₹8–17 L
-    c1  Mid SUV / Premium Sedan / Mid-Premium MUV
-                               Creta, Seltos, Octavia, Innova ₹12–22 L
-    c2  Full/Lifestyle SUV / Full-Size SUV
-                               Scorpio, XUV700, Fortuner      ₹15–35 L
-    d1  Premium SUV            CR-V, Santa Fe, Tucson         ₹25–45 L
-    d2  Luxury                 Mercedes, BMW, Audi            > ₹40 L
-
-Pitch  = bot actively sells, highlights price/EMI/features, tries to close.
-Suggest = bot mentions passively as an upgrade option only when relevant.
-"""
-
-from __future__ import annotations
-
-import asyncio
-from datetime import datetime
-from typing import List
-
-import httpx
-import pytz
-from num2words import num2words
-from pydantic_ai import RunContext
-from rapidfuzz import fuzz, process
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SEGMENT CODE MAP
-# Maps the 'Segment' values already present in SIMILAR_CARS → a1-d2 codes.
-# ─────────────────────────────────────────────────────────────────────────────
-SEGMENT_CODE_MAP: dict[str, str] = {
-    "Entry Hatchback":   "a1",
-    "Budget Hatchback":  "a2",
-    "Premium Hatchback": "a2",
-    "Van":               "a2",
-    "Micro SUV":         "b1",
-    "Compact Sedan":     "b1",
-    "Compact MUV":       "b1",
-    "Mid Sedan":         "b2",
-    "Compact SUV":       "b2",
-    "Utility SUV":       "b2",
-    "Premium Sedan":     "c1",
-    "Mid SUV":           "c1",
-    "Mid/Premium MUV":   "c1",
-    "Full/Lifestyle SUV": "c2",
-    "Full-Size SUV":     "c2",
-    "Premium SUV":       "d1",
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BUDGET → PITCH / SUGGEST SEGMENT BANDS
-# Returns (pitch_segments, suggest_segments) for a given max_price in lakhs.
-# When budget is 0 (unspecified) the bot pitches everything — no split.
-# ─────────────────────────────────────────────────────────────────────────────
-async def get_budget_pitch_suggest_segments(
-    max_price_lakhs: float,
-) -> tuple[list[str], list[str]]:
-    if max_price_lakhs <= 0:
-        return (["a1", "a2", "b1", "b2", "c1", "c2", "d1", "d2"], [])
-    elif max_price_lakhs <= 3.5:
-        return (["a1"], ["a2"])
-    elif max_price_lakhs <= 6:
-        return (["a1", "a2"], ["b1"])
-    elif max_price_lakhs <= 10:
-        return (["a2", "b1"], ["b2"])
-    elif max_price_lakhs <= 16:
-        return (["b1", "b2"], ["c1"])
-    elif max_price_lakhs <= 22:
-        return (["b2", "c1"], ["c2"])
-    elif max_price_lakhs <= 35:
-        return (["c1", "c2"], ["d1"])
-    else:
-        return (["c2", "d1"], ["d2"])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SEGMENT LOOKUP HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-async def _segment_from_price_body(price_rupees: float, body_type: str) -> str:
-    """
-    Fallback segment code for cars not covered by SIMILAR_CARS.
-    Uses price (in rupees) + body_type from the API response.
-    """
-    bt = (body_type or "").lower().strip()
-    p = price_rupees / 100_000  # convert to lakhs
-
-    if bt == "hatchback":
-        return "a1" if p <= 3.5 else "a2"
-
-    if bt == "sedan":
-        if p <= 10:  return "b1"
-        if p <= 16:  return "b2"
-        if p <= 25:  return "c1"
-        return "d1"
-
-    if bt in ("suv", "crossover"):
-        if p <= 10:  return "b1"
-        if p <= 16:  return "b2"
-        if p <= 22:  return "c1"
-        if p <= 35:  return "c2"
-        return "d1"
-
-    if bt in ("muv", "mpv", "minivan"):
-        if p <= 12:  return "b1"
-        if p <= 22:  return "c1"
-        return "c2"
-
-    # generic fallback
-    if p <= 3.5:  return "a1"
-    if p <= 6:    return "a2"
-    if p <= 10:   return "b1"
-    if p <= 16:   return "b2"
-    if p <= 22:   return "c1"
-    if p <= 35:   return "c2"
-    return "d1"
-
-
-async def get_car_segment(
-    make: str,
-    model: str,
-    price_rupees: float,
-    body_type: str,
-    similar_cars_dict: dict,
-) -> str:
-    """
-    Return the segment code (a1-d2) for a single car.
-
-    Lookup order:
-      1. Exact match on 'Make Model' key in SIMILAR_CARS.
-      2. Fuzzy match (≥ 70 score) against SIMILAR_CARS keys.
-      3. Price + body_type heuristic fallback.
-    """
-    make_model_str = f"{make} {model}".strip()
-    needle = make_model_str.casefold()
-
-    # 1. exact
-    for key, row in similar_cars_dict.items():
-        if key.casefold() == needle:
-            return SEGMENT_CODE_MAP.get(row.get("Segment", ""), None) or \
-                   await _segment_from_price_body(price_rupees, body_type)
-
-    # 2. fuzzy
-    match = process.extractOne(
-        make_model_str,
-        similar_cars_dict.keys(),
-        scorer=fuzz.WRatio,
-        score_cutoff=70,
-    )
-    if match:
-        best_key, _score, _ = match
-        seg_label = similar_cars_dict[best_key].get("Segment", "")
-        code = SEGMENT_CODE_MAP.get(seg_label)
-        if code:
-            return code
-
-    # 3. fallback
-    return await _segment_from_price_body(price_rupees, body_type)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PITCH / SUGGEST SPLITTER
-# ─────────────────────────────────────────────────────────────────────────────
-async def split_cars_by_role(
-    cars: list[dict],
-    pitch_segments: list[str],
-    suggest_segments: list[str],
-) -> tuple[list[dict], list[dict]]:
-    """
-    Partition cars into (to_pitch, to_suggest).
-
-    - Cars whose segment is in pitch_segments  → to_pitch.
-    - Cars whose segment is in suggest_segments → to_suggest.
-    - Cars not in either list are appended to to_pitch as a safe default
-      (prevents silently dropping results when segment lookup misses).
-    """
-    to_pitch: list[dict]   = []
-    to_suggest: list[dict] = []
-
-    for car in cars:
-        seg = car.get("segment", "")
-        if seg in suggest_segments:
-            to_suggest.append(car)
-        else:
-            to_pitch.append(car)
-
-    return to_pitch, to_suggest
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN FUNCTION
-# ─────────────────────────────────────────────────────────────────────────────
 async def get_cars_according_to_user_specifications(
-    ctx: RunContext,
-    make: str = "",
-    model: str = "",
-    city: str = "",
-    area_or_locality: str = "",
-    fuel_type: str = "",
-    max_price: float = 0,
-    transmission: str = "",
-    body_type: str = "",
-    min_year: str = "",
-    max_km_driven: str = "",
-    rto: str = "",
-    color: str = "",
-    seating_capacity: int = 0,
-    hub_id: int = 0,
-    pitched_cars_lead_ids: List[str] = None,
-    additional_user_preferences: List[str] = None,
+	ctx: "RunContext",
+	make: str = "",
+	model: str = "",
+	city: str = "",
+	area_or_locality: str = "",
+	fuel_type: str = "",
+	max_price: float = 0,
+	transmission: str = "",
+	body_type: str = "",
+	min_year: str = "",
+	max_km_driven: str = "",
+	rto: str = "",
+	color: str = "",
+	seating_capacity: int = 0,
+	hub_id: int = 0,
+	pitched_cars_lead_ids: "List[str]" = None,
+	additional_user_preferences: "List[str]" = None,
 ):
-    """
-    Get cars according to user specifications.
+	"""
+	Get cars according to user specifications.
 
-    Args:
-        make: Make of the car (e.g., "honda"). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g "hyundai,maruti".
-        model: Model of the car (e.g., "Alto", "Tiago"). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g "Alto,Tiago".
-        city: City of the car in english (e.g., 'mumbai'). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g 'mumbai,delhi'. This can only accept these enum values: ['agra','ahmedabad', 'bangalore', 'chandigarh', 'chennai', 'coimbatore', 'delhi', 'delhi-ncr', 'faridabad', 'ghaziabad', 'gurgaon', 'hyderabad', 'jaipur', 'karnal', 'kochi', 'kolkata', 'lucknow', 'mumbai', 'noida', 'pune', 'sonipat', 'ambala', 'kanpur', 'mysuru', 'vizag', 'visakhapatnam']
-        area_or_locality: Area or locality of the user (e.g., "andheri west"). if unspecified, use empty string.
-        fuel_type: Fuel type of the car (e.g., "petrol", "diesel", "cng", "petrol,cng", "diesel,cng"). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g "diesel,cng".
-        max_price: Maximum budget of the user in lakhs (example: if maximum budget is 10 lakh, use 10; if maximum budget is पाँच लाख, use 5); if unspecified, use 0. If the user provides a spoken range or a merged number (e.g. "25 30,00,000 की" meaning ₹25‑30 lakhs always take maximum value), interpret it as follows: when the car segment is economy (Alto, Swift, WagonR, Kwid, etc.) or the first two digits are sequential (45, 67, 89…), treat the number as a range and use the higher value (upper bound) for max_price; when the segment is luxury (Mercedes, BMW, Audi, Fortuner, Jeep, etc.) or no range cues are present, treat the figure as an exact budget. Convert any Hindi number words (e.g., पैंतीस लाख) to digits before applying the rule.
-        transmission: Transmission type of the car (e.g., "manual", "automatic"). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g "manual,automatic".
-        body_type: Body type of the car (e.g., "sedan", "hatchback", "suv"). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g "sedan,hatchback".
-        min_year: Minimum year of the car (e.g., "2020"). if unspecified, use empty string; if multiple values, use smallest year.
-        max_km_driven: Maximum km driven of the car (e.g., "10000"). if unspecified, use empty string; if multiple values, use largest km driven.
-        rto: rto state code of the car (e.g., "dl" for delhi). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g "dl,up". Allowed prefixes for states are [dl, ch, wb, up, ts, tn, rj, pb, mh, mp, ka, kl, hr, gj, ap] only. DONT use any other prefix.
-        color: Color of the car (e.g., "red", "white"). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g "red,white".
-        seating_capacity: Seating capacity of the car (e.g., 5, 7). if unspecified, use 0.
-        hub_id: hub_id of the hub where the user wants to see the car. if unspecified, use 0.
-        pitched_cars_lead_ids: list of all the car lead ids that have already been pitched to the user. This is used to filter out these cars from the results so that user is not shown the same car again. if unspecified, use empty list.
-        additional_user_preferences: list of additional user likes, dislikes,and rejection reasons not covered by other parameters. Store both positive preferences and rejection reasons here so future car pitches can follow them and avoid repeating rejected options. This is used to add these preferences to the response message while returning results. if unspecified, use empty list. eg. ["wants sunroof", "dislikes red color", "rejects cars older than 2020"]
-    Each arg should be in lower case.
-    """
-    from math import radians, sin, cos, asin, sqrt
-    from utils.city_wise_hubs import hubs_with_location
-    from utils.helpers import (
-        add_functions_called,
-        convert_to_words,
-        get_colors_for_filter,
-        get_hub_location,
-        get_hubs_as_string,
-        get_job_context,
-        get_seating_capacity_for_filter,
-        iso_to_human,
-        year_to_words,
-    )
+	Args:
+		make: Make of the car (e.g., "honda"). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g "hyundai,maruti".
+		model: Model of the car (e.g., "Alto", "Tiago"). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g "Alto,Tiago".
+		city: City of the car in english (e.g., 'mumbai'). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g 'mumbai,delhi'. This can only accept these enum values: ['agra','ahmedabad', 'bangalore', 'chandigarh', 'chennai', 'coimbatore', 'delhi', 'delhi-ncr', 'faridabad', 'ghaziabad', 'gurgaon', 'hyderabad', 'jaipur', 'karnal', 'kochi', 'kolkata', 'lucknow', 'mumbai', 'noida', 'pune', 'sonipat', 'ambala', 'kanpur', 'mysuru', 'vizag', 'visakhapatnam']
+		area_or_locality: Area or locality of the user (e.g., "andheri west"). if unspecified, use empty string.
+		fuel_type: Fuel type of the car (e.g., "petrol", "diesel", "cng", "petrol,cng", "diesel,cng"). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g "diesel,cng".
+		max_price: Maximum budget of the user in lakhs (example: if maximum budget is 10 lakh, use 10; if maximum budget is पाँच लाख, use 5); if unspecified, use 0. If the user provides a spoken range or a merged number (e.g. "25 30,00,000 की" meaning ₹25‑30 lakhs always take maximum value), interpret it as follows: when the car segment is economy (Alto, Swift, WagonR, Kwid, etc.) or the first two digits are sequential (45, 67, 89…), treat the number as a range and use the higher value (upper bound) for max_price; when the segment is luxury (Mercedes, BMW, Audi, Fortuner, Jeep, etc.) or no range cues are present, treat the figure as an exact budget. Convert any Hindi number words (e.g., पैंतीस लाख) to digits before applying the rule.
+		transmission: Transmission type of the car (e.g., "manual", "automatic"). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g "manual,automatic".
+		body_type: Body type of the car (e.g., "sedan", "hatchback", "suv"). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g "sedan,hatchback".
+		min_year: Minimum year of the car (e.g., "2020"). if unspecified, use empty string; if multiple values, use smallest year.
+		max_km_driven: Maximum km driven of the car (e.g., "10000"). if unspecified, use empty string; if multiple values, use largest km driven.
+		rto: rto state code of the car (e.g., "dl" for delhi). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g "dl,up". Allowed prefixes for states are [dl, ch, wb, up, ts, tn, rj, pb, mh, mp, ka, kl, hr, gj, ap] only. DONT use any other prefix.
+		color: Color of the car (e.g., "red", "white"). if unspecified, use empty string; if multiple values, separate by comma, without spaces between the items, e.g "red,white".
+		seating_capacity: Seating capacity of the car (e.g., 5, 7). if unspecified, use 0.
+		hub_id: hub_id of the hub where the user wants to see the car. if unspecified, use 0.
+		pitched_cars_lead_ids: list of all the car lead ids that have already been pitched to the user. This is used to filter out these cars from the results so that user is not shown the same car again. if unspecified, use empty list.
+		additional_user_preferences: list of additional user likes, dislikes,and rejection reasons not covered by other parameters. Store both positive preferences and rejection reasons here so future car pitches can follow them and avoid repeating rejected options. This is used to add these preferences to the response message while returning results. if unspecified, use empty list. eg. ["wants sunroof", "dislikes red color", "rejects cars older than 2020"]
+	Each arg should be in lower case.
+	"""
+	import asyncio
+	from datetime import datetime
+	from math import radians, sin, cos, asin, sqrt
+	import httpx
+	import pytz
+	from num2words import num2words
+	from rapidfuzz import process, fuzz
+	from utils.city_wise_hubs import hubs_with_location
+	from utils.helpers import (
+		add_functions_called,
+		convert_to_words,
+		get_colors_for_filter,
+		get_hub_location,
+		get_hubs_as_string,
+		get_job_context,
+		get_seating_capacity_for_filter,
+		iso_to_human,
+		year_to_words,
+	)
 
-    # ─────────────────────────────────────────────────────────────────────
-    # ALMOST_SIMILAR_CAR — variants/aliases of the same car family.
-    # When the user requests any entry in a row, we search the API for all
-    # entries in that row, then re-rank to bring the originally-requested
-    # variant to the front. The 70% fuzzy filter drops unrelated cars that
-    # might come back from the broadened API query.
-    # ─────────────────────────────────────────────────────────────────────
-    ALMOST_SIMILAR_CAR = [
+	# ──────────────────────────────────────────────────────────────────────────
+	# SEGMENT CODE MAP
+	# Maps the 'Segment' values already present in SIMILAR_CARS → a1-d2 codes.
+	#
+	# Segment codes (Indian used-car market):
+	#   a1  Entry Hatchback        Alto, Kwid, Eon               ≤ ₹3.5 L
+	#   a2  Budget/Premium Hatch   Swift, Baleno, i20, Wagon R    ₹3–8 L
+	#   b1  Compact Sedan / Micro SUV / Compact MUV
+	#                              Dzire, Punch, Kiger, Ertiga    ₹5–11 L
+	#   b2  Mid Sedan / Compact SUV / Utility SUV
+	#                              City, Nexon, Brezza, Venue     ₹8–17 L
+	#   c1  Mid SUV / Premium Sedan / Mid-Premium MUV
+	#                              Creta, Seltos, Octavia, Innova ₹12–22 L
+	#   c2  Full/Lifestyle SUV / Full-Size SUV
+	#                              Scorpio, XUV700, Fortuner      ₹15–35 L
+	#   d1  Premium SUV            CR-V, Santa Fe, Tucson         ₹25–45 L
+	#   d2  Luxury                 Mercedes, BMW, Audi            > ₹40 L
+	#
+	# Pitch  = bot actively sells, highlights price/EMI/features, tries to close.
+	# Suggest = bot mentions passively as an upgrade option only when relevant.
+	# ──────────────────────────────────────────────────────────────────────────
+	SEGMENT_CODE_MAP = {
+		"Entry Hatchback":    "a1",
+		"Budget Hatchback":   "a2",
+		"Premium Hatchback":  "a2",
+		"Van":                "a2",
+		"Micro SUV":          "b1",
+		"Compact Sedan":      "b1",
+		"Compact MUV":        "b1",
+		"Mid Sedan":          "b2",
+		"Compact SUV":        "b2",
+		"Utility SUV":        "b2",
+		"Premium Sedan":      "c1",
+		"Mid SUV":            "c1",
+		"Mid/Premium MUV":    "c1",
+		"Full/Lifestyle SUV": "c2",
+		"Full-Size SUV":      "c2",
+		"Premium SUV":        "d1",
+	}
+
+	# ──────────────────────────────────────────────────────────────────────────
+	# SEGMENT HELPERS  (nested async so they live entirely inside this function)
+	# ──────────────────────────────────────────────────────────────────────────
+	async def get_budget_pitch_suggest_segments(max_price_lakhs: float):
+		"""Return (pitch_segments, suggest_segments) for a given budget in lakhs."""
+		if max_price_lakhs <= 0:
+			return (["a1", "a2", "b1", "b2", "c1", "c2", "d1", "d2"], [])
+		elif max_price_lakhs <= 3.5:
+			return (["a1"], ["a2"])
+		elif max_price_lakhs <= 6:
+			return (["a1", "a2"], ["b1"])
+		elif max_price_lakhs <= 10:
+			return (["a2", "b1"], ["b2"])
+		elif max_price_lakhs <= 16:
+			return (["b1", "b2"], ["c1"])
+		elif max_price_lakhs <= 22:
+			return (["b2", "c1"], ["c2"])
+		elif max_price_lakhs <= 35:
+			return (["c1", "c2"], ["d1"])
+		else:
+			return (["c2", "d1"], ["d2"])
+
+	async def _segment_from_price_body(price_rupees: float, body_type: str) -> str:
+		"""Fallback segment code using price (₹) + body_type from the API."""
+		bt = (body_type or "").lower().strip()
+		p = price_rupees / 100_000  # lakhs
+
+		if bt == "hatchback":
+			return "a1" if p <= 3.5 else "a2"
+		if bt == "sedan":
+			if p <= 10:  return "b1"
+			if p <= 16:  return "b2"
+			if p <= 25:  return "c1"
+			return "d1"
+		if bt in ("suv", "crossover"):
+			if p <= 10:  return "b1"
+			if p <= 16:  return "b2"
+			if p <= 22:  return "c1"
+			if p <= 35:  return "c2"
+			return "d1"
+		if bt in ("muv", "mpv", "minivan"):
+			if p <= 12:  return "b1"
+			if p <= 22:  return "c1"
+			return "c2"
+		if p <= 3.5:  return "a1"
+		if p <= 6:    return "a2"
+		if p <= 10:   return "b1"
+		if p <= 16:   return "b2"
+		if p <= 22:   return "c1"
+		if p <= 35:   return "c2"
+		return "d1"
+
+	async def get_car_segment(make: str, model: str, price_rupees: float, body_type: str, similar_cars_dict: dict) -> str:
+		"""
+		Return segment code (a1-d2) for a single car.
+		Priority: exact SIMILAR_CARS match → fuzzy match (≥70) → price+body_type fallback.
+		"""
+		make_model_str = f"{make} {model}".strip()
+		needle = make_model_str.casefold()
+		for key, row in similar_cars_dict.items():
+			if key.casefold() == needle:
+				return SEGMENT_CODE_MAP.get(row.get("Segment", ""), None) or \
+					   await _segment_from_price_body(price_rupees, body_type)
+		match = process.extractOne(make_model_str, similar_cars_dict.keys(), scorer=fuzz.WRatio, score_cutoff=70)
+		if match:
+			best_key, _score, _ = match
+			code = SEGMENT_CODE_MAP.get(similar_cars_dict[best_key].get("Segment", ""))
+			if code:
+				return code
+		return await _segment_from_price_body(price_rupees, body_type)
+
+	async def split_cars_by_role(cars: list, pitch_segments: list, suggest_segments: list):
+		"""
+		Partition cars into (to_pitch, to_suggest).
+		Cars not in either list default to to_pitch so nothing is silently dropped.
+		"""
+		to_pitch, to_suggest = [], []
+		for car in cars:
+			seg = car.get("segment", "")
+			if seg in suggest_segments:
+				to_suggest.append(car)
+			else:
+				to_pitch.append(car)
+		return to_pitch, to_suggest
+
+	# ──────────────────────────────────────────────────────────────────────────
+	# ALMOST_SIMILAR_CAR — variants/aliases of the same car family.
+	# When the user requests any entry in a row, we search the API for all
+	# entries in that row, then re-rank to bring the originally-requested
+	# variant to the front. The 70% fuzzy filter drops unrelated cars that
+	# might come back from the broadened API query.
+	# ──────────────────────────────────────────────────────────────────────────
+	ALMOST_SIMILAR_CAR = [
         ["i20", "Elite i20", "New i20", "i20 Active", "i20 N Line"],
         ["i10", "Grand i10", "Grand i10 Nios"],
         ["Verna", "Fluidic Verna 4S"],
@@ -291,51 +221,45 @@ async def get_cars_according_to_user_specifications(
         ["Rapid", "Rapid New"],
         ["Hector", "Hector Plus"],
         ["Discovery", "Discovery Sport"],
-        ["GO", "Go Plus"],
+        ["GO", "Go Plus"]
     ]
 
-    def _norm(s: str) -> str:
-        """Lowercase, dashes→spaces, collapse whitespace."""
-        if not s:
-            return ""
-        return " ".join(str(s).replace("-", " ").lower().split())
+	def _norm(s: str) -> str:
+		"""Lowercase, dashes→spaces, collapse whitespace. Used for case-insensitive
+        exact-match comparisons of make/model strings."""
+		if not s:
+			return ""
+		return " ".join(str(s).replace("-", " ").lower().split())
 
-    def expand_almost_similar(value: str):
-        if not value:
-            return None, None
-        needle = _norm(value)
-        for row in ALMOST_SIMILAR_CAR:
-            if needle in [_norm(x) for x in row]:
-                api_csv = ",".join(_norm(x).replace(" ", "-") for x in row)
-                return api_csv, needle
-        return None, None
+	def expand_almost_similar(value: str):
+		if not value:
+			return None, None
+		needle = _norm(value)
+		for row in ALMOST_SIMILAR_CAR:
+			if needle in [_norm(x) for x in row]:
+				api_csv = ",".join(_norm(x).replace(" ", "-") for x in row)
+				return api_csv, needle
+		return None, None
 
-    if max_price:
-        max_price_in_lakhs = max_price * 100000 if max_price < 10000 else max_price
-        if max_price_in_lakhs > 5_000_000:  # 50 lakhs
-            return {
-                "success": False,
-                "message": (
-                    "Bot should ask the user to repeat their budget, now when user repeats "
-                    "their budget, if the budget provided is within 50 lakh then proceed "
-                    "further with help in car search, if the budget is still above 50 lakhs, "
-                    "say that you are sorry and that you wont be able to help you within this "
-                    "budget range, my senior expert will help you with this, and then end with "
-                    "'Thankyou Have a nice day.'"
-                ),
-            }
+	if max_price:
+		max_price_in_lakhs = max_price * 100000 if max_price < 10000 else max_price
+		if max_price_in_lakhs > 5000000:  # 50 lakhs
+			return {
+				"success": False,
+				"message": "Bot should ask the user to repeat their budget, now when user repeats their budget, if the budget provided is within 50 lakh then proceed further with help in car search, if the budget is still above 50 lakhs, say that you are sorry and that you wont be able to help you within this budget range, my senior expert will help you with this, and then end with 'Thankyou Have a nice day.'"
+			}
 
-    def get_params(params_1, params_2):
-        curr_params = {**params_1, **params_2}
-        if curr_params.get("model"):
-            curr_params.pop("body_type", None)
-        return curr_params
+	def get_params(params_1, params_2):
+		curr_params = {**params_1, **params_2}
+		if curr_params.get("model"):
+			curr_params.pop("body_type", None)
+		return curr_params
 
-    # ─────────────────────────────────────────────────────────────────────
-    # SIMILAR_CARS — competitor/alternative lookup table.
-    # Each entry includes a 'Segment' label that feeds the segment-code map.
-    # ─────────────────────────────────────────────────────────────────────
-    SIMILAR_CARS = {
+	# ──────────────────────────────────────────────────────────────────────────
+	# SIMILAR_CARS — competitor/alternative lookup table.
+	# Each entry includes a 'Segment' label that feeds SEGMENT_CODE_MAP.
+	# ──────────────────────────────────────────────────────────────────────────
+	SIMILAR_CARS = {
         'Maruti Alto': {'Brand': 'Maruti Suzuki', 'Segment': 'Entry Hatchback', 'Status': 'Current', 'Make Option A': 'Hyundai', 'Model Option A': 'i10', 'Make Option B': 'Hyundai', 'Model Option B': 'Eon', 'Make Option C': 'Renault', 'Model Option C': 'Kwid', 'Make Option D': '', 'Model Option D': '', 'Make Option E': '', 'Model Option E': '', 'Make': 'Maruti', 'Model': 'Alto'},
         'Maruti Estilo': {'Brand': 'Maruti Suzuki', 'Segment': 'Entry Hatchback', 'Status': 'Discontinued', 'Make Option A': 'Maruti', 'Model Option A': 'Alto', 'Make Option B': 'Hyundai', 'Model Option B': 'Eon', 'Make Option C': 'Hyundai', 'Model Option C': 'i10', 'Make Option D': '', 'Model Option D': '', 'Make Option E': '', 'Model Option E': '', 'Make': 'Maruti', 'Model': 'Estilo'},
         'Maruti A-Star': {'Brand': 'Maruti Suzuki', 'Segment': 'Entry Hatchback', 'Status': 'Discontinued', 'Make Option A': 'Maruti', 'Model Option A': 'Alto', 'Make Option B': 'Hyundai', 'Model Option B': 'i10', 'Make Option C': 'Hyundai', 'Model Option C': 'Eon', 'Make Option D': '', 'Model Option D': '', 'Make Option E': '', 'Model Option E': '', 'Make': 'Maruti', 'Model': 'A-Star'},
@@ -446,856 +370,889 @@ async def get_cars_according_to_user_specifications(
         'Toyota Fortuner': {'Brand': 'Toyota', 'Segment': 'Full-Size SUV', 'Status': 'Current', 'Make Option A': 'MG', 'Model Option A': 'Gloster', 'Make Option B': 'Hyundai', 'Model Option B': 'Tucson', 'Make Option C': 'Ford', 'Model Option C': 'Endeavour', 'Make Option D': '', 'Model Option D': '', 'Make Option E': '', 'Model Option E': '', 'Make': 'Toyota', 'Model': 'Fortuner'},
     }
 
-    def get_similar_cars_row(make_model: str, score_cutoff: int = 60):
-        if not make_model:
-            return None
-        needle = make_model.strip().casefold()
-        for key, row in SIMILAR_CARS.items():
-            if key.casefold() == needle:
-                return {"Model Make": key, **row}
-        match = process.extractOne(
-            make_model,
-            SIMILAR_CARS.keys(),
-            scorer=fuzz.WRatio,
-            score_cutoff=score_cutoff,
-        )
-        if match is None:
-            return None
-        best_key, _score, _ = match
-        return {"Model Make": best_key, **SIMILAR_CARS[best_key]}
+	def get_similar_cars_row(make_model: str, score_cutoff: int = 60):
+		if not make_model:
+			return None
+		needle = make_model.strip().casefold()
+		for key, row in SIMILAR_CARS.items():
+			if key.casefold() == needle:
+				return {"Model Make": key, **row}
+		match = process.extractOne(
+			make_model,
+			SIMILAR_CARS.keys(),
+			scorer=fuzz.WRatio,
+			score_cutoff=score_cutoff,
+		)
+		if match is None:
+			return None
+		best_key, _score, _ = match
+		return {"Model Make": best_key, **SIMILAR_CARS[best_key]}
 
-    # Derive pitch/suggest segments from the user's budget
-    max_price_lakhs = (
-        max_price * 100_000 / 100_000 if max_price >= 10_000 else max_price
-    )
-    pitch_segments, suggest_segments = await get_budget_pitch_suggest_segments(max_price_lakhs)
+	# Derive pitch/suggest segments from the user's budget
+	max_price_lakhs = max_price * 100_000 / 100_000 if max_price >= 10_000 else max_price
+	pitch_segments, suggest_segments = await get_budget_pitch_suggest_segments(max_price_lakhs)
 
-    async def return_cars(
-        ctx: RunContext,
-        payload: dict,
-        function_name: str,
-        diversify: bool = False,
-        prefer_model: str = "",
-        prefer_make: str = "",
-    ):
-        if payload.get("city", "") == "vizag":
-            payload.update({"city": "visakhapatnam"})
-        if payload.get("make", "") == "maruti":
-            payload.update({"make": "maruti-suzuki"})
-        if payload.get("model", "") == "maruti":
-            payload.update({"model": "maruti-suzuki"})
-        if payload.get("make", "") == "alto":
-            payload.update({"make": "alto,alto-800,alto-k10"})
-        if payload.get("model", "") == "alto":
-            payload.update({"model": "alto,alto-800,alto-k10"})
+	# ──────────────────────────────────────────────────────────────────────────
+	# return_cars — performs one API call, ranks/filters results.
+	# ──────────────────────────────────────────────────────────────────────────
+	async def return_cars(
+		ctx: "RunContext",
+		payload: dict,
+		function_name: str,
+		diversify: bool = False,
+		prefer_model: str = "",
+		prefer_make: str = "",
+	):
+		if payload.get("city", "") == "vizag":
+			payload.update({"city": "visakhapatnam"})
+		if payload.get("make", "") == "maruti":
+			payload.update({"make": "maruti-suzuki"})
+		if payload.get("model", "") == "maruti":
+			payload.update({"model": "maruti-suzuki"})
+		if payload.get("make", "") == "alto":
+			payload.update({"make": "alto,alto-800,alto-k10"})
+		if payload.get("model", "") == "alto":
+			payload.update({"model": "alto,alto-800,alto-k10"})
 
-        agent = ctx.session.current_agent
-        data = getattr(agent, "dial_info", {}) or {}
-        job_ctx = get_job_context()
-        curr_prompt = data.get("system_prompt", False)
-        if curr_prompt:
-            key_map = {"max_mileage": "max_km_driven"}
-            updated_prompt = curr_prompt
-            for key, value in payload.items():
-                placeholder = key_map.get(key, key)
-                updated_prompt = updated_prompt.replace(f"{{{placeholder}}}", str(value).strip())
-            if payload.get("city", False):
-                updated_prompt = updated_prompt.replace("{{city}}", payload.get("city", "").strip())
-                updated_prompt = updated_prompt.replace("{city}", payload.get("city", "").strip())
-                updated_prompt = updated_prompt.replace(
-                    "{available_hubs}",
-                    get_hubs_as_string(payload.get("city", "").strip()).get("hubs", ""),
-                )
-            await agent.update_instructions(updated_prompt)
+		agent = ctx.session.current_agent
+		data = getattr(agent, "dial_info", {}) or {}
+		job_ctx = get_job_context()
+		curr_prompt = data.get("system_prompt", False)
+		if curr_prompt:
+			key_map = {"max_mileage": "max_km_driven"}
+			updated_prompt = curr_prompt
+			for key, value in payload.items():
+				placeholder = key_map.get(key, key)
+				updated_prompt = updated_prompt.replace(f"{{{placeholder}}}", str(value).strip())
+			if payload.get("city", False):
+				updated_prompt = updated_prompt.replace("{{city}}", payload.get("city", "").strip())
+				updated_prompt = updated_prompt.replace("{city}", payload.get("city", "").strip())
+				updated_prompt = updated_prompt.replace(
+					"{available_hubs}",
+					get_hubs_as_string(payload.get("city", "").strip()).get("hubs", ""),
+				)
+			await agent.update_instructions(updated_prompt)
 
-        fixed_params = {
-            'product_type': 'cars',
-            'category': 'used',
-            'page': '1',
-            'show_max_on_assured': 'true',
-            'custom_budget_sort': 'true',
-            'prioritize_filter_listing': 'true',
-            'high_intent_required': 'false',
-            'active_banner': 'true',
-            'availability': 'available',
-        }
+		fixed_params = {
+			'product_type': 'cars',
+			'category': 'used',
+			'page': '1',
+			'show_max_on_assured': 'true',
+			'custom_budget_sort': 'true',
+			'prioritize_filter_listing': 'true',
+			'high_intent_required': 'false',
+			'active_banner': 'true',
+			'availability': 'available',
+		}
 
-        if payload.get("min_price") == 0:
-            payload.update({"min_price": ""})
-        elif isinstance(payload.get("min_price"), float):
-            min_p = payload.get("min_price") * 100000 if payload.get("min_price") < 10000 else payload.get("min_price")
-            payload.update({"min_price": str(int(min_p))})
+		if payload.get("min_price") == 0:
+			payload.update({"min_price": ""})
+		elif isinstance(payload.get("min_price"), float):
+			min_p = payload.get("min_price") * 100000 if payload.get("min_price") < 10000 else payload.get("min_price")
+			payload.update({"min_price": str(int(min_p))})
 
-        if payload.get("max_price") == 0:
-            payload.update({"max_price": ""})
-        elif isinstance(payload.get("max_price"), float):
-            max_p = payload.get("max_price") * 100000 if payload.get("max_price") < 10000 else payload.get("max_price")
-            if function_name == "get_cars_according_to_user_choice_with_extra_budget":
-                fixed_params.update({"o": "price"})
-            else:
-                fixed_params.update({"o": "-price"})
-            payload.update({"max_price": str(int(max_p))})
-        if function_name == "get_cars_according_to_user_choice_with_extra_budget":
-            fixed_params.update({"o": "price"})
+		if payload.get("max_price") == 0:
+			payload.update({"max_price": ""})
+		elif isinstance(payload.get("max_price"), float):
+			max_p = payload.get("max_price") * 100000 if payload.get("max_price") < 10000 else payload.get("max_price")
+			if function_name == "get_cars_according_to_user_choice_with_extra_budget":
+				fixed_params.update({"o": "price"})
+			else:
+				fixed_params.update({"o": "-price"})
+			payload.update({"max_price": str(int(max_p))})
+		if function_name == "get_cars_according_to_user_choice_with_extra_budget":
+			fixed_params.update({"o": "price"})
 
-        replacements = {
-            "डिज़ायर": "dzire", "डिजायर": "dzire",
-            "desire": "dzire", "dezire": "dzire",
-        }
-        for key in ("model", "make"):
-            if payload.get(key):
-                val = payload[key]
-                for old, new in replacements.items():
-                    val = val.replace(old, new)
-                if " " in val:
-                    with_dash = val.replace(" ", "-")
-                    val = f"{val},{with_dash}"
-                payload[key] = val
+		replacements = {
+			"डिज़ायर": "dzire", "डिजायर": "dzire",
+			"desire": "dzire", "dezire": "dzire",
+		}
+		for key in ("model", "make"):
+			if payload.get(key):
+				val = payload[key]
+				for old, new in replacements.items():
+					val = val.replace(old, new)
+				if " " in val:
+					with_dash = val.replace(" ", "-")
+					val = f"{val},{with_dash}"
+				payload[key] = val
 
-        ist = pytz.timezone("Asia/Kolkata")
-        now_ist = datetime.now(ist)
+		ist = pytz.timezone("Asia/Kolkata")
+		now_ist = datetime.now(ist)
 
-        def record(succ: bool, data=None):
-            new_f = {
-                "name": function_name,
-                "parameters": payload,
-                "success": succ,
-                "timestamp": now_ist.isoformat(),
-                "response": data,
-            }
-            add_functions_called(get_job_context(), new_f)
+		def record(succ: bool, data=None):
+			new_f = {
+				"name": function_name,
+				"parameters": payload,
+				"success": succ,
+				"timestamp": now_ist.isoformat(),
+				"response": data,
+			}
+			add_functions_called(get_job_context(), new_f)
 
-        url = "https://api.spinny.com/v3/api/listing/v3/"
-        make_local = payload.get("make", "")
-        model_local = payload.get("model", "")
-        copied_payload = payload.copy()
-        if model_local and make_local:
-            copied_payload.pop("make", None)
+		url = "https://api.spinny.com/v3/api/listing/v3/"
+		make_local = payload.get("make", "")
+		model_local = payload.get("model", "")
+		copied_payload = payload.copy()
+		if model_local and make_local:
+			copied_payload.pop("make", None)
 
-        async with httpx.AsyncClient() as client:
-            for _ in range(2):
-                resp = await client.get(url, params=get_params(fixed_params, copied_payload))
-                if resp.status_code == 200:
-                    break
-                await asyncio.sleep(1)
+		async with httpx.AsyncClient() as client:
+			for _ in range(2):
+				resp = await client.get(url, params=get_params(fixed_params, copied_payload))
+				if resp.status_code == 200:
+					break
+				await asyncio.sleep(1)
 
-        if resp.status_code == 200:
-            rj = resp.json()
-            filtered_count = rj.get("count", 0)
-            filtered = rj.get("results", []) or []
+		if resp.status_code == 200:
+			rj = resp.json()
+			filtered_count = rj.get("count", 0)
+			filtered = rj.get("results", []) or []
 
-            # Swap-make-and-model retry
-            if function_name != "check_model_availability" and filtered_count == 0 and (make_local or model_local):
-                for _swap_attempt in range(3):
-                    payload.update({"make": model_local.lower(), "model": make_local.lower()})
-                    make_local = payload.get("make", "")
-                    model_local = payload.get("model", "")
-                    copied_payload = payload.copy()
-                    if model_local and make_local:
-                        copied_payload.pop("make", None)
-                    async with httpx.AsyncClient() as client:
-                        for _ in range(2):
-                            resp = await client.get(url, params=get_params(fixed_params, copied_payload))
-                            if resp.status_code == 200:
-                                break
-                            await asyncio.sleep(1)
-                    if resp.status_code != 200:
-                        break
-                    rj = resp.json()
-                    filtered_count = rj.get("count", 0)
-                    filtered = rj.get("results", []) or []
-                    if filtered_count > 0 or not (make_local and model_local):
-                        break
+			# Swap-make-and-model retry (unchanged from original)
+			if function_name != "check_model_availability" and filtered_count == 0 and (make_local or model_local):
+				for _swap_attempt in range(3):
+					payload.update({"make": model_local.lower(), "model": make_local.lower()})
+					make_local = payload.get("make", "")
+					model_local = payload.get("model", "")
+					copied_payload = payload.copy()
+					if model_local and make_local:
+						copied_payload.pop("make", None)
+					async with httpx.AsyncClient() as client:
+						for _ in range(2):
+							resp = await client.get(url, params=get_params(fixed_params, copied_payload))
+							if resp.status_code == 200:
+								break
+							await asyncio.sleep(1)
+					if resp.status_code != 200:
+						break
+					rj = resp.json()
+					filtered_count = rj.get("count", 0)
+					filtered = rj.get("results", []) or []
+					if filtered_count > 0 or not (make_local and model_local):
+						break
 
-            additional_message = ''
-            existing_pitched = job_ctx.proc.userdata.setdefault("pitched_cars_lead_ids", [])
-            if filtered_count and existing_pitched:
-                existing_pitched_str = {str(lead_id) for lead_id in existing_pitched}
-                filtered = [i for i in filtered if str(i.get("id")) not in existing_pitched_str]
-                filtered_count = len(filtered)
+			additional_message = ''
+			existing_pitched = job_ctx.proc.userdata.setdefault("pitched_cars_lead_ids", [])
+			logger.info(f"Existing pitched cars lead_ids: {existing_pitched}")
+			if filtered_count and existing_pitched:
+				existing_pitched_str = {str(lead_id) for lead_id in existing_pitched}
+				new_filtered = [
+					item for item in filtered
+					if str(item.get("id")) not in existing_pitched_str
+				]
+				filtered = new_filtered
+				filtered_count = len(filtered)
 
-            city_payload = payload.get("city", "").strip().lower()
-            if filtered_count and city_payload in ["delhi", "gurgaon", "noida", "faridabad", "ghaziabad"]:
-                new_filtered = [i for i in filtered if i.get("city", "").strip().lower() == city_payload]
-                if new_filtered:
-                    filtered = new_filtered
-                    filtered_count = len(filtered)
-                else:
-                    additional_message = (
-                        f"The system could not find cars in {city_payload} with given choices, "
-                        f"then system searched for nearby locations of delhi-ncr, and then "
-                    )
+			city_payload = payload.get("city", "").strip().lower()
+			if filtered_count and city_payload in ["delhi", "gurgaon", "noida", "faridabad", "ghaziabad"]:
+				new_filtered = [
+					item for item in filtered
+					if item.get("city", "").strip().lower() == city_payload
+				]
+				if new_filtered:
+					filtered = new_filtered
+					filtered_count = len(filtered)
+					logger.info(f"After city-level filtering, found ({filtered_count}) cars from {function_name}")
+				else:
+					additional_message = f"The system could not find cars in {city_payload} with given choices, then system searched for nearby locations of delhi-ncr, and then "
 
-            count = num2words(filtered_count, lang='en_IN')
-            if filtered_count == 0:
-                record(True, {"msg": "no cars found"})
-                return {
-                    "success": True,
-                    "message": "sorry, no cars found for the given preferences.",
-                    "data": [],
-                    "count": filtered_count,
-                    "count_in_words": count,
-                }
+			count = num2words(filtered_count, lang='en_IN')
+			if filtered_count == 0:
+				record(True, { "msg": "no cars found" })
+				return {
+					"success": True,
+					"message": f"sorry, no cars found for the given preferences.",
+					"data": [],
+					"count": filtered_count,
+					"count_in_words": count
+				}
 
-            def rank_filtered(filtered, target_model, target_make, top_n=None):
-                ranked = []
-                for item in filtered:
-                    model_score = fuzz.token_set_ratio(str(item.get("model", "")), target_model)
-                    make_score = fuzz.token_set_ratio(str(item.get("make", "")), target_make)
-                    ranked.append({**item, "score": (model_score + make_score) / 2})
-                ranked.sort(key=lambda x: x["score"], reverse=True)
-                return ranked if top_n is None else ranked[:top_n]
+			def rank_filtered(filtered, target_model, target_make, top_n=None):
+				ranked = []
+				for item in filtered:
+					model_score = fuzz.token_set_ratio(str(item.get("model", "")), target_model)
+					make_score = fuzz.token_set_ratio(str(item.get("make", "")), target_make)
+					final_score = (model_score + make_score) / 2
+					ranked.append({**item, "score": final_score})
+				ranked.sort(key=lambda x: x["score"], reverse=True)
+				return ranked if top_n is None else ranked[:top_n]
 
-            def diversify_by_model(cars, max_total=15):
-                from collections import OrderedDict
-                model_buckets = OrderedDict()
-                for car in cars:
-                    model_name = car.get("model", "unknown").lower()
-                    model_buckets.setdefault(model_name, []).append(car)
-                for mn in model_buckets:
-                    model_buckets[mn].sort(key=lambda x: x.get("price", 0), reverse=True)
-                result = []
-                while len(result) < max_total:
-                    added_any = False
-                    for mn in list(model_buckets.keys()):
-                        bucket = model_buckets[mn]
-                        if bucket and len(result) < max_total:
-                            result.append(bucket.pop(0))
-                            added_any = True
-                        if not bucket:
-                            del model_buckets[mn]
-                    if not added_any:
-                        break
-                return result
+			def diversify_by_model(cars, max_total=15):
+				from collections import OrderedDict
+				model_buckets = OrderedDict()
+				for car in cars:
+					model_name = car.get("model", "unknown").lower()
+					if model_name not in model_buckets:
+						model_buckets[model_name] = []
+					model_buckets[model_name].append(car)
+				for model_name in model_buckets:
+					model_buckets[model_name].sort(key=lambda x: x.get("price", 0), reverse=True)
+				result = []
+				while len(result) < max_total:
+					added_any = False
+					for model_name in list(model_buckets.keys()):
+						bucket = model_buckets[model_name]
+						taken = 0
+						while taken < 1 and bucket and len(result) < max_total:
+							result.append(bucket.pop(0))
+							taken += 1
+							added_any = True
+						if not bucket:
+							del model_buckets[model_name]
+					if not added_any:
+						break
+				return result
 
-            model_local = payload.get("model", "")
-            make_local = payload.get("make", "")
+			model_local = payload.get("model", "")
+			make_local = payload.get("make", "")
 
-            HARSH_FUZZY_THRESHOLD = 70
-            if function_name == "check_model_availability":
-                ranked_filtered = filtered
-            elif prefer_model or prefer_make:
-                target_norm = prefer_model or prefer_make
-                scored = []
-                for item in filtered:
-                    car_model_norm = _norm(item.get("model", ""))
-                    car_make_norm = _norm(item.get("make", ""))
-                    if prefer_model and (
-                        car_model_norm == prefer_model
-                        or prefer_model in car_model_norm
-                        or car_model_norm in prefer_model
-                    ):
-                        tier = 0
-                    elif prefer_make and car_make_norm == prefer_make:
-                        tier = 1
-                    else:
-                        tier = 2
-                    family_score = max(
-                        fuzz.token_set_ratio(car_model_norm, target_norm),
-                        fuzz.token_set_ratio(car_make_norm, target_norm),
-                    )
-                    if tier == 2 and family_score < HARSH_FUZZY_THRESHOLD:
-                        continue
-                    scored.append({**item, "score": family_score, "_tier": tier})
-                scored.sort(key=lambda x: (x["_tier"], -x.get("price", 0)))
-                ranked_filtered = scored[:15]
-            elif model_local or make_local:
-                ranked_filtered = rank_filtered(filtered, model_local, make_local, top_n=15)
-            elif diversify:
-                ranked_filtered = diversify_by_model(filtered, max_total=15)
-            else:
-                ranked_filtered = filtered[:15]
+			# ─── Ranking decision ──────────────────────────────────────
+			HARSH_FUZZY_THRESHOLD = 70
+			if function_name == "check_model_availability":
+				ranked_filtered = filtered
 
-            if not ranked_filtered:
-                record(True, {"msg": "no cars passed harsh filter"})
-                return {
-                    "success": True,
-                    "message": "sorry, no cars found for the given preferences.",
-                    "data": [], "count": 0,
-                    "count_in_words": num2words(0, lang='en_IN'),
-                }
+			elif prefer_model or prefer_make:
+				target_norm = prefer_model or prefer_make
+				scored = []
+				for item in filtered:
+					car_model_norm = _norm(item.get("model", ""))
+					car_make_norm = _norm(item.get("make", ""))
 
-            record(True)
-            final_result = []
-            for car in ranked_filtered:
-                price_raw = car.get("price", 0)
-                price = num2words(round(price_raw, -3), lang='en_IN')
-                mileage = num2words(round(car.get("mileage", 0), -3), lang='en_IN')
-                discount = car.get("discount", {})
-                discount_value = discount.get("value", 0)
-                hub = car.get("hub", "")
-                hub_info = get_hub_location(car.get("hub_id", 0))
-                if hub_info is not None:
-                    hub = hub_info.get("pronounce_name", hub)
+					if prefer_model and (
+						car_model_norm == prefer_model
+						or prefer_model in car_model_norm
+						or car_model_norm in prefer_model
+					):
+						tier = 0
+					elif prefer_make and car_make_norm == prefer_make:
+						tier = 1
+					else:
+						tier = 2
 
-                # ── Segment assignment ──────────────────────────────────
-                car_make_raw = car.get("make", "")
-                car_model_raw = car.get("model", "")
-                car_segment = await get_car_segment(
-                    make=car_make_raw,
-                    model=car_model_raw,
-                    price_rupees=price_raw,
-                    body_type=car.get("body_type", ""),
-                    similar_cars_dict=SIMILAR_CARS,
-                )
-                # ───────────────────────────────────────────────────────
+					family_score = max(
+						fuzz.token_set_ratio(car_model_norm, target_norm),
+						fuzz.token_set_ratio(car_make_norm, target_norm),
+					)
 
-                new_car = {
-                    "car_lead_id": car.get("id", ""),
-                    "make_year": year_to_words(
-                        car.get("registration_year", 0),
-                        data.get("default_language", "en"),
-                    ),
-                    "make": convert_to_words(car_make_raw),
-                    "model": convert_to_words(car_model_raw.replace("Dzire", "डिज़ायर")),
-                    "variant": convert_to_words(car.get("variant", "")),
-                    "km_driven": mileage,
-                    "fuel_type": car.get("fuel_type", ""),
-                    "body_type": car.get("body_type", ""),
-                    "transmission": car.get("transmission", ""),
-                    "city": car.get("city", ""),
-                    "price": price,
-                    "perks": car.get("perks", ""),
-                    "color": car.get("color", ""),
-                    "hub": hub,
-                    "hub_id": car.get("hub_id", ""),
-                    "rto": car.get("rto", ""),
-                    "no_of_owners": car.get("no_of_owners", 0),
-                    "discount_value": (
-                        num2words(round(discount_value, -3), lang='en_IN')
-                        if discount_value > 0 else "no discount"
-                    ),
-                    "segment": car_segment,   # ← new field
-                }
-                if discount_value > 0:
-                    discount_start_time = iso_to_human(discount.get("start_time", now_ist.isoformat()))
-                    discount_end_time   = iso_to_human(discount.get("end_time",   now_ist.isoformat()))
-                    new_car.update({
-                        "discount_start_time": f"{discount_start_time.get('date')} {discount_start_time.get('month')}",
-                        "discount_end_time":   f"{discount_end_time.get('date')} {discount_end_time.get('month')}",
-                        "price_after_discount": num2words(
-                            round(discount.get("final_discounted_price", price_raw), -3),
-                            lang='en_IN',
-                        ),
-                    })
-                final_result.append(new_car)
+					if tier == 2 and family_score < HARSH_FUZZY_THRESHOLD:
+						continue
 
-            if function_name != "get_number_of_cars_in_a_city":
-                job_ctx.proc.userdata["last_fetched"] = final_result
-                ALLOWED_KEYS = {
-                    "car_lead_id", "make", "model", "variant", "price",
-                    "make_year", "fuel_type", "transmission", "city",
-                    "color", "km_driven", "segment",
-                }
-                existing = job_ctx.proc.userdata.setdefault("prefetch_output", {}).setdefault("fetched_cars", [])
-                seen_ids = {x.get("car_lead_id") for x in existing if isinstance(x, dict)}
-                for item in final_result:
-                    car_lead_id = item.get("car_lead_id")
-                    if car_lead_id and car_lead_id not in seen_ids:
-                        existing.append({k: item[k] for k in ALLOWED_KEYS if k in item})
-                        seen_ids.add(car_lead_id)
+					scored.append({**item, "score": family_score, "_tier": tier})
 
-            existing_prefs = job_ctx.proc.userdata.setdefault("additional_user_preferences", [])
-            existing_prefs_str = ", ".join(existing_prefs)
-            if existing_prefs_str:
-                existing_prefs_str = (
-                    f"User has also mentioned these additional preferences: {existing_prefs_str}. "
-                    f"Consider these preferences when pitching the cars, and if possible, try to "
-                    f"find cars that take care of these additional preferences as well. "
-                )
+				scored.sort(key=lambda x: (x["_tier"], -x.get("price", 0)))
+				ranked_filtered = scored[:15]
 
-            used_standard_fuzzy = (
-                not (prefer_model or prefer_make)
-                and (model_local or make_local)
-                and function_name != "check_model_availability"
-            )
-            if used_standard_fuzzy and ranked_filtered[0].get("score", 100) < 30:
-                return {
-                    "success": False,
-                    "message": additional_message + "The system couldn't find an exact match for the model the user mentioned. ",
-                    "data": [], "count": 0, "count_in_words": "zero",
-                }
+			elif model_local or make_local:
+				ranked_filtered = rank_filtered(filtered, model_local, make_local, top_n=15)
 
-            if model_local and (
-                model_local in ranked_filtered[0]["model"].lower()
-                or ranked_filtered[0]["model"].lower() in model_local
-            ):
-                message = (
-                    f'[SYSTEM INSTRUCTION - DO NOT READ ALOUD] Cars found: '
-                    f'{"काफ़ी" if filtered_count > 10 else filtered_count} cars matching the users request. '
-                    f'{existing_prefs_str}'
-                )
-            else:
-                message = (
-                    f'[SYSTEM INSTRUCTION - DO NOT READ ALOUD] Cars found: '
-                    f'{"काफ़ी" if filtered_count > 10 else filtered_count} cars matching the users request. '
-                    f'{existing_prefs_str}.'
-                )
+			elif diversify:
+				ranked_filtered = diversify_by_model(filtered, max_total=15)
 
-            # ── Segment split for this result set ──────────────────────
-            cars_to_pitch, cars_to_suggest = await split_cars_by_role(
-                final_result, pitch_segments, suggest_segments
-            )
-            # ───────────────────────────────────────────────────────────
+			else:
+				ranked_filtered = filtered[:15]
 
-            return {
-                "success": True,
-                "message": additional_message + message,
-                "existing_prefs_str": existing_prefs_str,
-                "additional_message": additional_message,
-                "data": final_result,
-                "cars_to_pitch": cars_to_pitch,
-                "cars_to_suggest": cars_to_suggest,
-                "count": filtered_count,
-                "count_in_words": count,
-            }
+			# If the harsh filter wiped everything out, treat as 0 cars
+			if not ranked_filtered:
+				record(True, { "msg": "no cars passed harsh filter" })
+				return {
+					"success": True,
+					"message": "sorry, no cars found for the given preferences.",
+					"data": [],
+					"count": 0,
+					"count_in_words": num2words(0, lang='en_IN')
+				}
 
-        record(False, resp.json())
-        return {
-            "success": False,
-            "message": "Failed to get cars for the given preferences",
-            "data": [],
-        }
+			record(True)
+			final_result = []
+			for car in ranked_filtered:
+				price_raw = car.get("price", 0)
+				price = num2words(round(price_raw, -3), lang='en_IN')
+				mileage = num2words(round(car.get("mileage", 0), -3), lang='en_IN')
+				discount = car.get("discount", {})
+				discount_value = discount.get("value", 0)
+				hub = car.get("hub", "")
+				hub_info = get_hub_location(car.get("hub_id", 0))
+				if hub_info is not None:
+					hub = hub_info.get("pronounce_name", hub)
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Build payload
-    # ─────────────────────────────────────────────────────────────────────
-    pitched_cars_lead_ids     = pitched_cars_lead_ids     or []
-    additional_user_preferences = additional_user_preferences or []
+				# ── Segment assignment ────────────────────────────────────────────────
+				car_make_raw  = car.get("make", "")
+				car_model_raw = car.get("model", "")
+				car_segment = await get_car_segment(
+					make=car_make_raw,
+					model=car_model_raw,
+					price_rupees=price_raw,
+					body_type=car.get("body_type", ""),
+					similar_cars_dict=SIMILAR_CARS,
+				)
+				# ─────────────────────────────────────────────────────────────────────
 
-    job_ctx = get_job_context()
-    existing_pitched = job_ctx.proc.userdata.setdefault("pitched_cars_lead_ids", [])
-    existing_prefs   = job_ctx.proc.userdata.setdefault("additional_user_preferences", [])
-    job_ctx.proc.userdata["pitched_cars_lead_ids"]       = list(set(existing_pitched + pitched_cars_lead_ids))
-    job_ctx.proc.userdata["additional_user_preferences"] = list(set(existing_prefs + additional_user_preferences))
-    all_pitched = job_ctx.proc.userdata["pitched_cars_lead_ids"]
-    all_prefs   = job_ctx.proc.userdata["additional_user_preferences"]
+				new_car = {
+					"car_lead_id": car.get("id", ""),
+					"make_year": year_to_words(car.get("registration_year", 0), data.get("default_language", "en")),
+					"make": convert_to_words(car_make_raw),
+					"model": convert_to_words(car_model_raw.replace("Dzire", "डिज़ायर")),
+					"variant": convert_to_words(car.get("variant", "")),
+					"km_driven": mileage,
+					"fuel_type": car.get("fuel_type", ""),
+					"body_type": car.get("body_type", ""),
+					"transmission": car.get("transmission", ""),
+					"city": car.get("city", ""),
+					"price": price,
+					"perks": car.get("perks", ""),
+					"color": car.get("color", ""),
+					"hub": hub,
+					"hub_id": car.get("hub_id", ""),
+					"rto": car.get("rto", ""),
+					"no_of_owners": car.get("no_of_owners", 0),
+					"discount_value": num2words(round(discount_value, -3), lang='en_IN') if discount_value > 0 else "no discount",
+					"segment": car_segment,   # ← new field
+				}
+				if discount_value > 0:
+					discount_start_time = iso_to_human(discount.get("start_time", now_ist.isoformat()))
+					discount_end_time = iso_to_human(discount.get("end_time", now_ist.isoformat()))
+					new_car.update({
+						"discount_start_time": f"{discount_start_time.get('date')} {discount_start_time.get('month')}",
+						"discount_end_time": f"{discount_end_time.get('date')} {discount_end_time.get('month')}",
+						"price_after_discount": num2words(round(discount.get("final_discounted_price", price_raw), -3), lang='en_IN')
+					})
+				final_result.append(new_car)
+			logger.info(f"Returning from {function_name}: {final_result}")
 
-    payload = {
-        "make":       make.lower(),
-        "model":      model.lower(),
-        "city":       city.lower(),
-        "fuel_type":  fuel_type.lower(),
-        "max_price":  max_price,
-        "transmission": transmission.lower(),
-        "body_type":  body_type.lower(),
-        "min_year":   min_year,
-        "max_mileage": max_km_driven,
-        "rto":        rto.lower(),
-        "color":      get_colors_for_filter(color.lower()),
-        "seats":      get_seating_capacity_for_filter(seating_capacity),
-        "pitched_cars_lead_ids": all_pitched,
-        "additional_preferences": all_prefs,
-    }
-    payload = {k: v for k, v in payload.items() if v}
-    if hub_id and hub_id > 0:
-        hub_info = get_hub_location(hub_id)
-        if hub_info is not None:
-            hub_keyword = hub_info.get("search_keyword", None)
-            if hub_keyword is not None:
-                payload.update({"hub": hub_keyword})
+			if function_name != "get_number_of_cars_in_a_city":
+				job_ctx.proc.userdata["last_fetched"] = final_result
+				ALLOWED_KEYS = {"car_lead_id", "make", "model", "variant", "price", "make_year", "fuel_type", "transmission", "city", "color", "km_driven", "segment"}
+				existing = job_ctx.proc.userdata.setdefault("prefetch_output", {}).setdefault("fetched_cars", [])
+				seen_ids = {x.get("car_lead_id") for x in existing if isinstance(x, dict)}
+				for item in final_result:
+					car_lead_id = item.get("car_lead_id")
+					if car_lead_id and car_lead_id not in seen_ids:
+						existing.append({k: item[k] for k in ALLOWED_KEYS if k in item})
+						seen_ids.add(car_lead_id)
 
-    expanded_model, original_model_norm = expand_almost_similar(payload.get("model", ""))
-    expanded_make,  original_make_norm  = expand_almost_similar(payload.get("make",  ""))
-    if expanded_model:
-        payload["model"] = expanded_model
-    if expanded_make:
-        payload["make"] = expanded_make
+			existing_prefs = job_ctx.proc.userdata.setdefault("additional_user_preferences", [])
+			existing_prefs_str = ", ".join(existing_prefs)
+			if existing_prefs_str:
+				existing_prefs_str = (
+					f"User has also mentioned these additional preferences: {existing_prefs_str}. "
+					f"Consider these preferences when pitching the cars, and if possible, try to find cars that take care of these additional preferences as well. "
+				)
 
-    prefer_kwargs = {
-        "prefer_model": original_model_norm or "",
-        "prefer_make":  original_make_norm  or "",
-    }
+			used_standard_fuzzy = not (prefer_model or prefer_make) and (model_local or make_local) and function_name != "check_model_availability"
+			if used_standard_fuzzy and ranked_filtered[0].get("score", 100) < 30:
+				message = "The system couldn't find an exact match for the model the user mentioned. "
+				logger.info(f"Returning due to low score {ranked_filtered[0].get('score', 0)} {additional_message} {message}")
+				return {
+					"success": False,
+					"message": additional_message + message,
+					"data": [],
+					"count": 0,
+					"count_in_words": "zero"
+				}
 
-    should_diversify = not payload.get("make") and not payload.get("model")
+			if model_local and (model_local in ranked_filtered[0]["model"].lower() or ranked_filtered[0]["model"].lower() in model_local):
+				message = (
+					f'[SYSTEM INSTRUCTION - DO NOT READ ALOUD] Cars found:  {"काफ़ी" if filtered_count > 10 else filtered_count} cars matching the users request. {existing_prefs_str}'
+				)
+			else:
+				message = (
+					f'[SYSTEM INSTRUCTION - DO NOT READ ALOUD] Cars found: {"काफ़ी" if filtered_count > 10 else filtered_count} cars matching the users request. {existing_prefs_str}.'
+				)
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Geocode → nearest-hub bias
-    # ─────────────────────────────────────────────────────────────────────
-    hub_keywords_str = ""
-    if (
-        not hub_id
-        and payload.get("city", "") in [
-            "bangalore", "chennai", "delhi", "delhi-ncr",
-            "ghaziabad", "hyderabad", "mumbai", "pune",
-        ]
-        and area_or_locality
-    ):
-        async def find_nearest_hubs(city: str, locality: str) -> dict:
-            api_key = "AIzaSyAd9g4_ufJJNOW6qqRbcDspsS3AX9NopO8"
-            address = f"{locality} {city}".strip()
-            url = "https://maps.googleapis.com/maps/api/geocode/json"
-            params = {"address": address, "key": api_key}
+			logger.info(f"Message to return for {function_name}: {message}")
 
-            async def _geocode():
-                for attempt in range(3):
-                    try:
-                        async with httpx.AsyncClient(timeout=10.0) as client:
-                            resp = await client.get(url, params=params)
-                        if resp.status_code != 200:
-                            await asyncio.sleep(1)
-                            continue
-                        data = resp.json()
-                        status = data.get("status")
-                        if status != "OK":
-                            if status == "ZERO_RESULTS":
-                                return {"error": True, "message": "Address could not be geocoded (no results)."}
-                            return {"error": True, "message": f"Geocoding failed: {status}"}
-                        results = data.get("results", [])
-                        if not results:
-                            return {"error": True, "message": "No geocoding results returned."}
-                        loc = results[0].get("geometry", {}).get("location")
-                        if not loc or "lat" not in loc or "lng" not in loc:
-                            return {"error": True, "message": "Geocoding response missing location."}
-                        return {"error": False, "lat": float(loc["lat"]), "lng": float(loc["lng"])}
-                    except Exception:
-                        await asyncio.sleep(1)
-                return {"error": True, "message": "Failed to geocode address after multiple attempts."}
+			# ── Segment split ─────────────────────────────────────────────────────
+			cars_to_pitch, cars_to_suggest = await split_cars_by_role(
+				final_result, pitch_segments, suggest_segments
+			)
+			# ─────────────────────────────────────────────────────────────────────
 
-            geocode_result = await _geocode()
-            if geocode_result.get("error"):
-                return {"status": "error", "message": geocode_result.get("message", "Geocoding failed.")}
-            user_lat = geocode_result["lat"]
-            user_lng = geocode_result["lng"]
+			return {
+				"success": True,
+				"message": additional_message + message,
+				"existing_prefs_str": existing_prefs_str,
+				"additional_message": additional_message,
+				"data": final_result,
+				"cars_to_pitch": cars_to_pitch,
+				"cars_to_suggest": cars_to_suggest,
+				"count": filtered_count,
+				"count_in_words": count
+			}
 
-            def _haversine(lat1, lon1, lat2, lon2):
-                from math import radians, sin, cos, asin, sqrt
-                R = 6371.0
-                dlat = radians(lat2 - lat1)
-                dlon = radians(lon2 - lon1)
-                a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-                return R * 2 * asin(sqrt(a))
+		record(False, resp.json())
+		return {
+			"success": False,
+			"message": "Failed to get cars for the given preferences",
+			"data": [],
+		}
 
-            city_key = city.strip().lower()
-            matched = [
-                h for h in hubs_with_location
-                if any(city_key == t.lower() for t in (h.get("city_tags") or []))
-            ] or list(hubs_with_location)
+	# ──────────────────────────────────────────────────────────────────────────
+	# Build payload
+	# ──────────────────────────────────────────────────────────────────────────
+	pitched_cars_lead_ids = pitched_cars_lead_ids or []
+	additional_user_preferences = additional_user_preferences or []
 
-            hubs_with_dist = []
-            for hub in matched:
-                try:
-                    hlat = float(hub.get("lat"))
-                    hlng = float(hub.get("long") or hub.get("lng") or 0)
-                except Exception:
-                    continue
-                hubs_with_dist.append({
-                    **hub,
-                    "distance_km": round(_haversine(user_lat, user_lng, hlat, hlng), 3),
-                })
-            if not hubs_with_dist:
-                return {"status": "error", "message": "No hubs with valid coordinates available."}
-            hubs_with_dist.sort(key=lambda x: x["distance_km"])
-            return {"status": "success", "hubs": hubs_with_dist[:3]}
+	job_ctx = get_job_context()
+	existing_pitched = job_ctx.proc.userdata.setdefault("pitched_cars_lead_ids", [])
+	existing_prefs = job_ctx.proc.userdata.setdefault("additional_user_preferences", [])
+	job_ctx.proc.userdata["pitched_cars_lead_ids"] = list(set(existing_pitched + pitched_cars_lead_ids))
+	job_ctx.proc.userdata["additional_user_preferences"] = list(set(existing_prefs + additional_user_preferences))
+	all_pitched = job_ctx.proc.userdata["pitched_cars_lead_ids"]
+	all_prefs = job_ctx.proc.userdata["additional_user_preferences"]
 
-        hubs_result = await find_nearest_hubs(payload.get("city", ""), area_or_locality)
-        if hubs_result.get("status") == "success":
-            hub_keywords = [h.get("search_keyword", "") for h in hubs_result.get("hubs", []) if h.get("search_keyword")]
-            if hub_keywords:
-                hub_keywords_str = ",".join(hub_keywords)
+	payload = {
+		"make": make.lower(),
+		"model": model.lower(),
+		"city": city.lower(),
+		"fuel_type": fuel_type.lower(),
+		"max_price": max_price,
+		"transmission": transmission.lower(),
+		"body_type": body_type.lower(),
+		"min_year": min_year,
+		"max_mileage": max_km_driven,
+		"rto": rto.lower(),
+		"color": get_colors_for_filter(color.lower()),
+		"seats": get_seating_capacity_for_filter(seating_capacity),
+		"pitched_cars_lead_ids": all_pitched,
+		"additional_preferences": all_prefs
+	}
+	payload = {k: v for k, v in payload.items() if v}
+	if hub_id and hub_id > 0:
+		hub_info = get_hub_location(hub_id)
+		if hub_info is not None:
+			hub_keyword = hub_info.get("search_keyword", None)
+			if hub_keyword is not None:
+				payload.update({"hub": hub_keyword})
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Primary search
-    # ─────────────────────────────────────────────────────────────────────
-    if hub_keywords_str:
-        nearest_hubs_primary_result = await return_cars(
-            ctx, {**payload, "hub": hub_keywords_str},
-            "get_cars_according_to_user_specifications",
-            diversify=should_diversify, **prefer_kwargs,
-        )
-    else:
-        nearest_hubs_primary_result = {"count": 0, "data": []}
+	# ──────────────────────────────────────────────────────────────────────────
+	# Expand model/make via ALMOST_SIMILAR_CAR grid
+	# ──────────────────────────────────────────────────────────────────────────
+	expanded_model, original_model_norm = expand_almost_similar(payload.get("model", ""))
+	expanded_make, original_make_norm = expand_almost_similar(payload.get("make", ""))
+	if expanded_model:
+		payload["model"] = expanded_model
+	if expanded_make:
+		payload["make"] = expanded_make
 
-    if nearest_hubs_primary_result.get("count", 0) > 10:
-        primary_result = nearest_hubs_primary_result
-    else:
-        basic_primary_result = await return_cars(
-            ctx, {**payload},
-            "get_cars_according_to_user_specifications",
-            diversify=should_diversify, **prefer_kwargs,
-        )
-        if basic_primary_result.get("count", 0):
-            all_data   = basic_primary_result.get("data", []) + nearest_hubs_primary_result.get("data", [])
-            unique_data = list({item.get("car_lead_id"): item for item in all_data}.values())
-            # Re-split after merging so pitch/suggest counts are accurate
-            merged_pitch, merged_suggest = await split_cars_by_role(unique_data, pitch_segments, suggest_segments)
-            primary_result = {
-                **basic_primary_result,
-                "data":            unique_data,
-                "cars_to_pitch":   merged_pitch,
-                "cars_to_suggest": merged_suggest,
-                "count":           len(unique_data),
-            }
-        else:
-            primary_result = basic_primary_result
+	prefer_kwargs = {
+		"prefer_model": original_model_norm or "",
+		"prefer_make": original_make_norm or "",
+	}
 
-    primary_cars_count = primary_result.get("count", 0)
-    excluded_keys = {"pitched_cars_lead_ids", "additional_preferences", "city", "max_price"}
-    primary_preferences = [k for k in payload if k not in excluded_keys]
-    primary_preferences_count = len(primary_preferences)
-    if primary_preferences_count == 2 and "make" in primary_preferences and "model" in primary_preferences:
-        primary_preferences = ["model"]
-        primary_preferences_count = 1
+	should_diversify = not payload.get("make") and not payload.get("model")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # CASE 1: > 10 cars → ask another preference question
-    # ─────────────────────────────────────────────────────────────────────
-    if primary_cars_count > 10:
-        return {
-            "next_action": (
-                "There are many cars available matching the user's preferences. To narrow down the options, "
-                "ask the user the next preference question that has not been asked. Do not mention that we want "
-                "to narrow down cars. Once the user provides this additional preference, use it to filter the "
-                "cars further and return the updated list of cars using get_cars_according_to_user_specifications "
-                "function. If ALL preference questions have already been asked, start pitching cars"
-            ),
-            **primary_result,
-        }
+	# ──────────────────────────────────────────────────────────────────────────
+	# Geocode → nearest-hub bias
+	# ──────────────────────────────────────────────────────────────────────────
+	hub_keywords_str = ""
+	if not hub_id and payload.get("city", "") in ["bangalore", "chennai", "delhi", "delhi-ncr", "ghaziabad", "hyderabad", "mumbai", "pune"] and area_or_locality:
+		async def find_nearest_hubs(city: str, locality: str) -> dict:
+			api_key = "AIzaSyAd9g4_ufJJNOW6qqRbcDspsS3AX9NopO8"
+			address = f"{locality} {city}".strip()
+			url = "https://maps.googleapis.com/maps/api/geocode/json"
+			params = {"address": address, "key": api_key}
 
-    # Pre-compute "slightly over budget" pool for CASE 2 and CASE 3
-    next_budget_count  = 0
-    next_budget_result = {"count": 0, "data": []}
-    has_budget = max_price > 0
-    if has_budget:
-        next_budget_result = await return_cars(
-            ctx, {**payload, "min_price": max_price, "max_price": 1.1 * max_price},
-            "get_cars_according_to_user_choice_with_extra_budget",
-            **prefer_kwargs,
-        )
-        next_budget_count = next_budget_result.get("count", 0)
+			async def _geocode():
+				for attempt in range(3):
+					try:
+						async with httpx.AsyncClient(timeout=10.0) as client:
+							resp = await client.get(url, params=params)
+						if resp.status_code != 200:
+							logger.warning("Geocode request returned status %s (attempt %s).", resp.status_code, attempt + 1)
+							await asyncio.sleep(1)
+							continue
+						data = resp.json()
+						status = data.get("status")
+						if status != "OK":
+							if status == "ZERO_RESULTS":
+								return {"error": True, "message": "Address could not be geocoded (no results)."}
+							return {"error": True, "message": f"Geocoding failed: {status}"}
+						results = data.get("results", [])
+						if not results:
+							return {"error": True, "message": "No geocoding results returned."}
+						loc = results[0].get("geometry", {}).get("location")
+						if not loc or "lat" not in loc or "lng" not in loc:
+							return {"error": True, "message": "Geocoding response missing location."}
+						return {"error": False, "lat": float(loc["lat"]), "lng": float(loc["lng"])}
+					except httpx.RequestError:
+						logger.exception("HTTP error while calling Geocoding API (attempt %s).", attempt + 1)
+						await asyncio.sleep(1)
+						continue
+					except Exception:
+						logger.exception("Unexpected error while geocoding (attempt %s).", attempt + 1)
+						await asyncio.sleep(1)
+						continue
+				return {"error": True, "message": "Failed to geocode address after multiple attempts."}
 
-    # ─────────────────────────────────────────────────────────────────────
-    # CASE 2: 1–10 cars → split and pitch
-    # ─────────────────────────────────────────────────────────────────────
-    if primary_cars_count > 0:
-        pitch_list   = primary_result.get("cars_to_pitch",   primary_result.get("data", []))
-        suggest_list = primary_result.get("cars_to_suggest", [])
+			geocode_result = await _geocode()
+			if geocode_result.get("error"):
+				return {"status": "error", "message": geocode_result.get("message", "Geocoding failed.")}
+			user_lat = geocode_result["lat"]
+			user_lng = geocode_result["lng"]
 
-        pitch_count   = len(pitch_list)
-        suggest_count = len(suggest_list)
+			def _haversine(lat1, lon1, lat2, lon2):
+				R = 6371.0
+				dlat = radians(lat2 - lat1)
+				dlon = radians(lon2 - lon1)
+				a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+				c = 2 * asin(sqrt(a))
+				return R * c
 
-        if next_budget_count:
-            ext_pitch, ext_suggest = (
-                next_budget_result.get("cars_to_pitch",   next_budget_result.get("data", [])),
-                next_budget_result.get("cars_to_suggest", []),
-            )
-            return {
-                "next_action": (
-                    f"Found {pitch_count} car(s) to PITCH within budget "
-                    f"(segments: {', '.join(sorted(set(c.get('segment','?') for c in pitch_list)))}) "
-                    f"and {suggest_count} car(s) to SUGGEST as upgrades. "
-                    f"Additionally found {next_budget_count} car(s) in the slightly extended budget range. "
-                    f"Pitch the cars_to_pitch list first. "
-                    f"Only mention cars_to_suggest when the user asks for upgrade options or nothing from pitch suits them. "
-                    f"If only one car is within budget pitch it and also introduce one car from extended budget as an option."
-                ),
-                "cars_to_pitch": pitch_list,
-                "cars_to_suggest": suggest_list,
-                "cars_in_extended_budget": {
-                    "existing_prefs_str": next_budget_result.get("existing_prefs_str", ""),
-                    "additional_message": next_budget_result.get("additional_message", ""),
-                    "cars_to_pitch":   ext_pitch,
-                    "cars_to_suggest": ext_suggest,
-                    "data":            next_budget_result.get("data", []),
-                },
-            }
+			city_key = city.strip().lower()
+			matched = []
+			for hub in hubs_with_location:
+				tags = hub.get("city_tags", []) or []
+				if any(city_key == t.lower() for t in tags):
+					matched.append(hub)
+			if not matched:
+				matched = list(hubs_with_location)
+			hubs_with_dist = []
+			for hub in matched:
+				try:
+					hlat = float(hub.get("lat"))
+					hlng = float(hub.get("long") or hub.get("lng") or 0)
+				except Exception:
+					continue
+				dist_km = _haversine(user_lat, user_lng, hlat, hlng)
+				hub_copy = dict(hub)
+				hub_copy["distance_km"] = round(dist_km, 3)
+				hubs_with_dist.append(hub_copy)
+			if not hubs_with_dist:
+				return {"status": "error", "message": "No hubs with valid coordinates available."}
+			hubs_with_dist.sort(key=lambda x: x["distance_km"])
+			nearest = hubs_with_dist[:3]
+			return {"status": "success", "hubs": nearest}
 
-        return {
-            "next_action": (
-                f"Pitch the {pitch_count} car(s) in cars_to_pitch "
-                f"(segments: {', '.join(sorted(set(c.get('segment','?') for c in pitch_list))) or 'mixed'}). "
-                f"{'Mention cars_to_suggest only if user asks for something better or pricier — do not pitch them.' if suggest_list else ''}"
-            ),
-            "cars_to_pitch":   pitch_list,
-            "cars_to_suggest": suggest_list,
-            "existing_prefs_str": primary_result.get("existing_prefs_str", ""),
-            "additional_message": primary_result.get("additional_message", ""),
-        }
+		hubs_result = await find_nearest_hubs(payload.get("city", ""), area_or_locality)
+		if hubs_result.get("status") == "success":
+			nearest_hubs = hubs_result.get("hubs", [])
+			if nearest_hubs:
+				hub_keywords = [h.get("search_keyword", "") for h in nearest_hubs]
+				if hub_keywords:
+					hub_keywords_str = ",".join(hub_keywords)
 
-    # ─────────────────────────────────────────────────────────────────────
-    # CASE 3: 0 cars → phased relaxation
-    # ─────────────────────────────────────────────────────────────────────
-    if next_budget_count:
-        ext_pitch, ext_suggest = (
-            next_budget_result.get("cars_to_pitch",   next_budget_result.get("data", [])),
-            next_budget_result.get("cars_to_suggest", []),
-        )
-        return {
-            "next_action": "pitch available cars",
-            "cars_to_pitch":   ext_pitch,
-            "cars_to_suggest": ext_suggest,
-            **next_budget_result,
-        }
+	# ──────────────────────────────────────────────────────────────────────────
+	# Primary search
+	# ──────────────────────────────────────────────────────────────────────────
+	if hub_keywords_str:
+		nearest_hubs_primary_result = await return_cars(
+			ctx, {**payload, "hub": hub_keywords_str},
+			"get_cars_according_to_user_specifications",
+			diversify=should_diversify, **prefer_kwargs,
+		)
+	else:
+		nearest_hubs_primary_result = {"count": 0, "data": []}
 
-    if primary_preferences_count == 0:
-        if not has_budget:
-            return primary_result
-        relaxed_budget_only = await return_cars(
-            ctx, {**payload, "max_price": 0},
-            "get_cars_according_to_user_choice_with_extra_budget",
-            **prefer_kwargs,
-        )
-        if relaxed_budget_only.get("count", 0) > 0:
-            rb_pitch, rb_suggest = (
-                relaxed_budget_only.get("cars_to_pitch",   relaxed_budget_only.get("data", [])),
-                relaxed_budget_only.get("cars_to_suggest", []),
-            )
-            return {
-                "next_action": (
-                    f"No cars found matching the user's specifications. "
-                    f"However, found {relaxed_budget_only.get('count', 0)} cars when we relax the budget constraint. "
-                    f"Lowest priced car starts from {relaxed_budget_only['data'][0]['price']}. "
-                    f"Would you like to see cars in this range? If user says yes, pitch from cars_to_pitch first."
-                ),
-                "cars_to_pitch":   rb_pitch,
-                "cars_to_suggest": rb_suggest,
-                "cars_in_extended_budget": {
-                    "existing_prefs_str": relaxed_budget_only.get("existing_prefs_str", ""),
-                    "additional_message": relaxed_budget_only.get("additional_message", ""),
-                    "data": relaxed_budget_only.get("data", []),
-                },
-            }
-        return primary_result
+	if nearest_hubs_primary_result.get("count", 0) > 10:
+		primary_result = nearest_hubs_primary_result
+	else:
+		basic_primary_result = await return_cars(
+			ctx, {**payload},
+			"get_cars_according_to_user_specifications",
+			diversify=should_diversify, **prefer_kwargs,
+		)
+		if basic_primary_result.get("count", 0):
+			all_data = basic_primary_result.get("data", []) + nearest_hubs_primary_result.get("data", [])
+			unique_data = list({item.get("car_lead_id"): item for item in all_data}.values())
+			# Re-split after merging so pitch/suggest counts are accurate
+			merged_pitch, merged_suggest = await split_cars_by_role(unique_data, pitch_segments, suggest_segments)
+			primary_result = {
+				**basic_primary_result,
+				"data": unique_data,
+				"cars_to_pitch": merged_pitch,
+				"cars_to_suggest": merged_suggest,
+				"count": len(unique_data),
+			}
+		else:
+			primary_result = basic_primary_result
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Phased relaxation (Phase 1 → 2 → 3a → 3b)
-    # ─────────────────────────────────────────────────────────────────────
-    PHASE_1_KEYS = ["hub", "hub_id", "rto", "min_year", "color", "max_mileage"]
-    PHASE_3_KEYS = ["make", "owner", "fuel_type", "transmission", "seats", "body_type", "max_price"]
+	primary_cars_count = primary_result.get("count", 0)
+	excluded_keys = {
+		"pitched_cars_lead_ids",
+		"additional_preferences",
+		"city",
+		"max_price",
+	}
+	primary_preferences = [k for k in payload if k not in excluded_keys]
+	primary_preferences_count = len(primary_preferences)
+	if primary_preferences_count == 2 and "make" in primary_preferences and "model" in primary_preferences:
+		primary_preferences = ["model"]
+		primary_preferences_count = 1
 
-    relaxed_payload = {**payload}
-    dropped_keys    = []
+	# ──────────────────────────────────────────────────────────────────────────
+	# CASE 1: > 10 cars → ask another preference question
+	# ──────────────────────────────────────────────────────────────────────────
+	if primary_cars_count > 10:
+		return {
+			"next_action": (
+				"There are many cars available matching the user's preferences. To narrow down the options, "
+				"ask the user the next preference question that has not been asked. Do not mention that we want to narrow down cars. "
+				"Once the user provides this additional preference, use it to filter the cars further and return "
+				"the updated list of cars using get_cars_according_to_user_specifications function. "
+				"If ALL preference questions have already been asked, start pitching cars"
+			),
+			**primary_result
+		}
 
-    def _relaxed_response(retry_result, dropped):
-        pretty_drops = ", ".join(dropped) if len(dropped) <= 2 else "कुछ"
-        r_pitch   = retry_result.get("cars_to_pitch",   retry_result.get("data", []))
-        r_suggest = retry_result.get("cars_to_suggest", [])
-        return {
-            "next_action": (
-                f"No cars found matching all of the user's specifications. "
-                f"However, found {retry_result.get('count', 0)} cars after relaxing: {', '.join(dropped)}. "
-                f"If we relax {pretty_drops} then "
-                f"{'many' if retry_result.get('count', 0) > 10 else retry_result.get('count', 0)} options are available. "
-                f"Can we see them?"
-            ),
-            "cars_to_pitch":   r_pitch,
-            "cars_to_suggest": r_suggest,
-            "cars_with_relaxed_preferences": {
-                "existing_prefs_str": retry_result.get("existing_prefs_str", ""),
-                "additional_message": retry_result.get("additional_message", ""),
-                "data":               retry_result.get("data", []),
-            },
-        }
+	# Pre-compute "slightly over budget" pool for CASE 2 and CASE 3
+	next_budget_count = 0
+	next_budget_result = {"count": 0, "data": []}
+	has_budget = max_price > 0
+	if has_budget:
+		next_budget_result = await return_cars(
+			ctx, {**payload, "min_price": max_price, "max_price": 1.1 * max_price},
+			"get_cars_according_to_user_choice_with_extra_budget",
+			**prefer_kwargs,
+		)
+		next_budget_count = next_budget_result.get("count", 0)
 
-    for key in PHASE_1_KEYS:
-        if key not in relaxed_payload:
-            continue
-        dropped_keys.append(key)
-        del relaxed_payload[key]
-        retry = await return_cars(ctx, {**relaxed_payload}, "get_cars_with_relaxed_preferences", **prefer_kwargs)
-        if retry.get("count", 0) > 0:
-            return _relaxed_response(retry, dropped_keys)
+	# ──────────────────────────────────────────────────────────────────────────
+	# CASE 2: 1–10 cars → split and pitch
+	# ──────────────────────────────────────────────────────────────────────────
+	if primary_cars_count > 0:
+		pitch_list   = primary_result.get("cars_to_pitch",   primary_result.get("data", []))
+		suggest_list = primary_result.get("cars_to_suggest", [])
+		pitch_count   = len(pitch_list)
+		suggest_count = len(suggest_list)
 
-    if "model" in primary_preferences:
-        lookup_make  = original_make_norm  or payload.get("make",  "")
-        lookup_model = original_model_norm or payload.get("model", "")
-        make_model_str = f"{lookup_make} {lookup_model}".strip()
-        similar_row = get_similar_cars_row(make_model_str)
-        if similar_row:
-            model_a = similar_row["Model Option A"]
-            model_b = similar_row["Model Option B"]
-            model_c = similar_row["Model Option C"]
-            model_search = ",".join(
-                m.lower().replace(" ", "-") for m in (model_a, model_b, model_c) if m
-            )
-            similar_model_results = await return_cars(
-                ctx,
-                {**relaxed_payload, "model": model_search, "make": ""},
-                "check_model_availability",
-            )
-            if similar_model_results.get("count", 0) > 0:
-                similar_data = similar_model_results.get("data", [])
-                available_make_models = ", ".join({f"{i['make']} {i['model']}" for i in similar_data})
-                relaxed_budget = await return_cars(
-                    ctx, {**payload, "max_price": 0},
-                    "get_cars_according_to_user_choice_with_extra_budget",
-                    **prefer_kwargs,
-                )
-                sm_pitch, sm_suggest = (
-                    similar_model_results.get("cars_to_pitch",   similar_data),
-                    similar_model_results.get("cars_to_suggest", []),
-                )
-                if relaxed_budget.get("count", 0) > 0:
-                    rb_pitch, rb_suggest = (
-                        relaxed_budget.get("cars_to_pitch",   relaxed_budget.get("data", [])),
-                        relaxed_budget.get("cars_to_suggest", []),
-                    )
-                    msg = (
-                        f"Lowest option of {make_model_str} starts from {relaxed_budget['data'][0]['price']}. "
-                        f"Would you like to see cars in this range? "
-                        f"Also similar cars to {make_model_str} are available like {available_make_models}, "
-                        f"would you like to explore them?"
-                    )
-                    return {
-                        "next_action": (
-                            f"No cars found matching all of the user's specifications. "
-                            f"However, found cars after relaxing preferences. {msg}"
-                        ),
-                        "similar_model_cars_to_pitch":   sm_pitch,
-                        "similar_model_cars_to_suggest": sm_suggest,
-                        "cars_with_relaxed_budget_to_pitch":   rb_pitch,
-                        "cars_with_relaxed_budget_to_suggest": rb_suggest,
-                        "similar_model_cars_within_user_budget": {
-                            "existing_prefs_str": similar_model_results.get("existing_prefs_str", ""),
-                            "additional_message": similar_model_results.get("additional_message", ""),
-                            "data": similar_data,
-                        },
-                        "cars_with_relaxed_budget": {
-                            "existing_prefs_str": relaxed_budget.get("existing_prefs_str", ""),
-                            "additional_message": relaxed_budget.get("additional_message", ""),
-                            "data": relaxed_budget.get("data", []),
-                        },
-                    }
-                return {
-                    "next_action": (
-                        f"{make_model_str} not found. Ask if they would like to see other similar options "
-                        f"like {available_make_models}"
-                    ),
-                    "similar_model_cars_to_pitch":   sm_pitch,
-                    "similar_model_cars_to_suggest": sm_suggest,
-                    "similar_model_cars_within_user_budget": {
-                        "existing_prefs_str": similar_model_results.get("existing_prefs_str", ""),
-                        "additional_message": similar_model_results.get("additional_message", ""),
-                        "data": similar_data,
-                    },
-                }
+		if next_budget_count:
+			ext_pitch   = next_budget_result.get("cars_to_pitch",   next_budget_result.get("data", []))
+			ext_suggest = next_budget_result.get("cars_to_suggest", [])
+			return {
+				"next_action": (
+					f"Found {pitch_count} car(s) to PITCH within budget "
+					f"(segments: {', '.join(sorted(set(c.get('segment','?') for c in pitch_list)))}) "
+					f"and {suggest_count} car(s) to SUGGEST as upgrades. "
+					f"Additionally found {next_budget_count} car(s) in the slightly extended budget range. "
+					f"Pitch the cars_to_pitch list first. "
+					f"Only mention cars_to_suggest when the user asks for upgrade options or nothing from pitch suits them. "
+					f"If only one car is within budget pitch it and also introduce one car from extended budget as an option."
+				),
+				"cars_to_pitch": pitch_list,
+				"cars_to_suggest": suggest_list,
+				"cars_in_extended_budget": {
+					"existing_prefs_str": next_budget_result.get("existing_prefs_str", ""),
+					"additional_message": next_budget_result.get("additional_message", ""),
+					"cars_to_pitch":   ext_pitch,
+					"cars_to_suggest": ext_suggest,
+					"data": next_budget_result.get("data", []),
+				},
+			}
 
-    if "model" in relaxed_payload:
-        dropped_keys.append("model")
-        del relaxed_payload["model"]
-        retry = await return_cars(ctx, {**relaxed_payload}, "get_cars_with_relaxed_preferences")
-        if retry.get("count", 0) > 0:
-            return _relaxed_response(retry, dropped_keys)
+		return {
+			"next_action": (
+				f"Pitch the {pitch_count} car(s) in cars_to_pitch "
+				f"(segments: {', '.join(sorted(set(c.get('segment','?') for c in pitch_list))) or 'mixed'}). "
+				f"{'Mention cars_to_suggest only if user asks for something better or pricier — do not pitch them.' if suggest_list else ''}"
+			),
+			"cars_to_pitch":   pitch_list,
+			"cars_to_suggest": suggest_list,
+			"existing_prefs_str": primary_result.get("existing_prefs_str", ""),
+			"additional_message": primary_result.get("additional_message", ""),
+		}
 
-    for key in PHASE_3_KEYS:
-        if key not in relaxed_payload:
-            continue
-        dropped_keys.append(key)
-        del relaxed_payload[key]
-        fn = (
-            "get_cars_according_to_user_choice_with_extra_budget"
-            if key == "max_price"
-            else "get_cars_with_relaxed_preferences"
-        )
-        retry = await return_cars(ctx, {**relaxed_payload}, fn)
-        if retry.get("count", 0) > 0:
-            return _relaxed_response(retry, dropped_keys)
+	# ──────────────────────────────────────────────────────────────────────────
+	# CASE 3: 0 cars → phased relaxation
+	# ──────────────────────────────────────────────────────────────────────────
+	if next_budget_count:
+		ext_pitch   = next_budget_result.get("cars_to_pitch",   next_budget_result.get("data", []))
+		ext_suggest = next_budget_result.get("cars_to_suggest", [])
+		return {
+			"next_action": "pitch available cars",
+			"cars_to_pitch":   ext_pitch,
+			"cars_to_suggest": ext_suggest,
+			**next_budget_result,
+		}
 
-    return {
-        "next_action": (
-            "No cars found even after relaxing all preferences. "
-            "Apologize to the user and suggest they try with a different city or check back later."
-        ),
-        "count": 0,
-        "data":  [],
-    }
+	# Special case: no preferences at all → just try a budget relax
+	if primary_preferences_count == 0:
+		if not has_budget:
+			return primary_result
+		relaxed_budget_only = await return_cars(
+			ctx, {**payload, "max_price": 0},
+			"get_cars_according_to_user_choice_with_extra_budget",
+			**prefer_kwargs,
+		)
+		if relaxed_budget_only.get("count", 0) > 0:
+			rb_pitch   = relaxed_budget_only.get("cars_to_pitch",   relaxed_budget_only.get("data", []))
+			rb_suggest = relaxed_budget_only.get("cars_to_suggest", [])
+			return {
+				"next_action": (
+					f"No cars found matching the user's specifications. "
+					f"However, found {relaxed_budget_only.get('count', 0)} cars when we relax the budget constraint. "
+					f"Lowest priced car starts from {relaxed_budget_only['data'][0]['price']}. "
+					f"Would you like to see cars in this range? If user says yes, pitch from cars_to_pitch first."
+				),
+				"cars_to_pitch":   rb_pitch,
+				"cars_to_suggest": rb_suggest,
+				"cars_in_extended_budget": {
+					"existing_prefs_str": relaxed_budget_only.get("existing_prefs_str", ""),
+					"additional_message": relaxed_budget_only.get("additional_message", ""),
+					"data": relaxed_budget_only.get("data", []),
+				},
+			}
+		return primary_result
+
+	# ──────────────────────────────────────────────────────────────────────────
+	# Phased drop order
+	# Phase 1:  drop ['hub','hub_id','rto','min_year','color','max_mileage']
+	# Phase 2:  SIMILAR_CARS competitor lookup (if model was specified)
+	# Phase 3a: drop model entirely
+	# Phase 3b: drop make, owner, fuel_type, transmission, seats, body_type, max_price
+	# ──────────────────────────────────────────────────────────────────────────
+	PHASE_1_KEYS = ["hub", "hub_id", "rto", "min_year", "color", "max_mileage"]
+	PHASE_3_KEYS = ["make", "owner", "fuel_type", "transmission", "seats", "body_type", "max_price"]
+
+	relaxed_payload = {**payload}
+	dropped_keys = []
+
+	def _relaxed_response(retry_result, dropped):
+		pretty_drops = ", ".join(dropped) if len(dropped) <= 2 else "कुछ"
+		r_pitch   = retry_result.get("cars_to_pitch",   retry_result.get("data", []))
+		r_suggest = retry_result.get("cars_to_suggest", [])
+		return {
+			"next_action": (
+				f"No cars found matching all of the user's specifications. "
+				f"However, found {retry_result.get('count', 0)} cars after relaxing the following preferences: {', '.join(dropped)}. "
+				f"If we relax some constraints like {pretty_drops} then "
+				f"{'many' if retry_result.get('count', 0) > 10 else retry_result.get('count', 0)} options are available. "
+				f"can we see them?"
+			),
+			"cars_to_pitch":   r_pitch,
+			"cars_to_suggest": r_suggest,
+			"cars_with_relaxed_preferences": {
+				"existing_prefs_str": retry_result.get("existing_prefs_str", ""),
+				"additional_message": retry_result.get("additional_message", ""),
+				"data": retry_result.get("data", []),
+			},
+		}
+
+	# ── Phase 1 ───────────────────────────────────────────────────────────────
+	for key in PHASE_1_KEYS:
+		if key not in relaxed_payload:
+			continue
+		dropped_keys.append(key)
+		del relaxed_payload[key]
+		retry = await return_cars(
+			ctx, {**relaxed_payload},
+			"get_cars_with_relaxed_preferences",
+			**prefer_kwargs,
+		)
+		if retry.get("count", 0) > 0:
+			return _relaxed_response(retry, dropped_keys)
+
+	# ── Phase 2: SIMILAR_CARS competitor lookup ────────────────────────────────
+	if "model" in primary_preferences:
+		lookup_make = original_make_norm or payload.get("make", "")
+		lookup_model = original_model_norm or payload.get("model", "")
+		make_model_str = f"{lookup_make} {lookup_model}".strip()
+
+		similar_row = get_similar_cars_row(make_model_str)
+		if similar_row:
+			logger.info(f"similar_row {similar_row}")
+			model_a = similar_row["Model Option A"]
+			model_b = similar_row["Model Option B"]
+			model_c = similar_row["Model Option C"]
+			model_search = ",".join(
+				m.lower().replace(" ", "-")
+				for m in (model_a, model_b, model_c) if m
+			)
+			logger.info(f"model_search {model_search}")
+
+			similar_model_results = await return_cars(
+				ctx,
+				{**relaxed_payload, "model": model_search, "make": ""},
+				"check_model_availability",
+			)
+			if similar_model_results.get("count", 0) > 0:
+				similar_data = similar_model_results.get("data", [])
+				available_make_models = ", ".join(
+					{f"{i['make']} {i['model']}" for i in similar_data}
+				)
+				relaxed_budget = await return_cars(
+					ctx, {**payload, "max_price": 0},
+					"get_cars_according_to_user_choice_with_extra_budget",
+					**prefer_kwargs,
+				)
+				sm_pitch   = similar_model_results.get("cars_to_pitch",   similar_data)
+				sm_suggest = similar_model_results.get("cars_to_suggest", [])
+				if relaxed_budget.get("count", 0) > 0:
+					rb_pitch   = relaxed_budget.get("cars_to_pitch",   relaxed_budget.get("data", []))
+					rb_suggest = relaxed_budget.get("cars_to_suggest", [])
+					msg = (
+						f'lowest option of {make_model_str} starts from {relaxed_budget["data"][0]["price"]}. '
+						f"Would you like to see cars in this range?"
+						f"also similar cars to {make_model_str} are available  "
+						f"like {available_make_models}, would you like to explore them?"
+					)
+					return {
+						"next_action": (
+							f"No cars found matching all of the user's specifications. "
+							f"However, found cars after relaxing the user's preferences. {msg}"
+						),
+						"similar_model_cars_to_pitch":   sm_pitch,
+						"similar_model_cars_to_suggest": sm_suggest,
+						"cars_with_relaxed_budget_to_pitch":   rb_pitch,
+						"cars_with_relaxed_budget_to_suggest": rb_suggest,
+						"similar_model_cars_within_user_budget": {
+							"existing_prefs_str": similar_model_results.get("existing_prefs_str", ""),
+							"additional_message": similar_model_results.get("additional_message", ""),
+							"data": similar_data,
+						},
+						"cars_with_relaxed_budget": {
+							"existing_prefs_str": relaxed_budget.get("existing_prefs_str", ""),
+							"additional_message": relaxed_budget.get("additional_message", ""),
+							"data": relaxed_budget.get("data", []),
+						},
+					}
+				return {
+					"next_action": (
+						f"{make_model_str} not found. Ask if they would like to see other similar options like {available_make_models}"
+					),
+					"similar_model_cars_to_pitch":   sm_pitch,
+					"similar_model_cars_to_suggest": sm_suggest,
+					"similar_model_cars_within_user_budget": {
+						"existing_prefs_str": similar_model_results.get("existing_prefs_str", ""),
+						"additional_message": similar_model_results.get("additional_message", ""),
+						"data": similar_data,
+					},
+				}
+
+	# ── Phase 3a: drop model entirely ─────────────────────────────────────────
+	if "model" in relaxed_payload:
+		dropped_keys.append("model")
+		del relaxed_payload["model"]
+		retry = await return_cars(
+			ctx, {**relaxed_payload},
+			"get_cars_with_relaxed_preferences",
+		)
+		if retry.get("count", 0) > 0:
+			return _relaxed_response(retry, dropped_keys)
+
+	# ── Phase 3b ──────────────────────────────────────────────────────────────
+	for key in PHASE_3_KEYS:
+		if key not in relaxed_payload:
+			continue
+		dropped_keys.append(key)
+		del relaxed_payload[key]
+		function_name_for_drop = (
+			"get_cars_according_to_user_choice_with_extra_budget"
+			if key == "max_price"
+			else "get_cars_with_relaxed_preferences"
+		)
+		retry = await return_cars(
+			ctx, {**relaxed_payload}, function_name_for_drop,
+		)
+		if retry.get("count", 0) > 0:
+			return _relaxed_response(retry, dropped_keys)
+
+	# ── Nothing found at all ──────────────────────────────────────────────────
+	return {
+		"next_action": (
+			"No cars found even after relaxing all preferences. "
+			"Apologize to the user and suggest they try with a different city or check back later."
+		),
+		"count": 0,
+		"data": []
+	}
