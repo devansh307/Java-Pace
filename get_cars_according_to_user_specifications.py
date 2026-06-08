@@ -1199,17 +1199,64 @@ async def get_cars_according_to_user_specifications(
 			and similar_within_budget_result.get("count", 0) > 0
 		)
 
-		# ── 2c: Advisor-style response ────────────────────────────────────────
+		# ── 2c: Advisor-style response — all text assembled from fetched data ───
 		if model_found_above_budget or alternatives_exist:
 			starting_price = (
 				model_at_any_price["data"][0]["price"]
 				if model_found_above_budget
 				else None
 			)
+			_model_status       = "over_budget" if model_found_above_budget else "not_in_inventory"
+			_above_budget_count = model_at_any_price.get("count", 0) if model_found_above_budget else 0
+			_alt_count          = similar_within_budget_result.get("count", 0) if alternatives_exist else 0
+
+			# Build next_action entirely from fetched data — no hardcoded phrases.
+			action_parts = [
+				f"Requested model '{make_model_str}': status = {_model_status}."
+			]
+			if model_found_above_budget:
+				action_parts.append(
+					f"{_above_budget_count} listing(s) of '{make_model_str}' exist in inventory "
+					f"but are all above the user's budget; cheapest is priced at {starting_price}."
+				)
+			else:
+				action_parts.append(
+					f"'{make_model_str}' has no listings in inventory."
+				)
+
+			if alternatives_exist:
+				alt_segments = sorted({c.get("segment", "") for c in (similar_within_budget_result.get("data") or []) if c.get("segment")})
+				action_parts.append(
+					f"Found {_alt_count} same-segment alternative(s) within the user's budget "
+					f"(segment(s): {', '.join(alt_segments) or 'n/a'}): {available_make_models}."
+				)
+				action_parts.append(
+					"Inform the user of the model's status using the data above, "
+					"then offer the available alternatives. "
+					"If the user agrees, pitch from cars_to_pitch using the default pitching logic."
+				)
+			else:
+				action_parts.append(
+					f"No same-segment alternatives found within the user's budget."
+				)
+				if model_found_above_budget:
+					action_parts.append(
+						f"Ask the user if they would like to increase their budget to at least "
+						f"{starting_price} to consider '{make_model_str}'. "
+						f"If yes, pitch from cars_with_relaxed_budget_to_pitch."
+					)
+
+			advisor_context = {
+				"requested_model":            make_model_str,
+				"model_status":               _model_status,
+				"model_listings_above_budget": _above_budget_count,
+				"model_starting_price":        starting_price,
+				"alternatives_count":          _alt_count,
+				"alternatives_summary":        available_make_models,
+				"segment_code":                requested_segment_code,
+			}
 
 			if model_found_above_budget and alternatives_exist:
-				# Requested model exists but is over the user's budget, AND
-				# same-segment alternatives are available within budget.
 				sim_data   = similar_within_budget_result.get("data", [])
 				sm_pitch   = similar_within_budget_result.get("cars_to_pitch",   sim_data)
 				sm_suggest = similar_within_budget_result.get("cars_to_suggest", [])
@@ -1217,13 +1264,8 @@ async def get_cars_according_to_user_specifications(
 				rb_pitch   = model_at_any_price.get("cars_to_pitch",   rb_data)
 				rb_suggest = model_at_any_price.get("cars_to_suggest", [])
 				return {
-					"next_action": (
-						f"{make_model_str} currently aapke budget mein available nahi hai. "
-						f"{make_model_str} ka starting price {starting_price} hai. "
-						f"Similar options jaise {available_make_models} aapke budget mein available hain. "
-						f"Ask the user if they would like to explore these similar options. "
-						f"If yes, pitch from cars_to_pitch using the default pitching logic."
-					),
+					"next_action":   " ".join(action_parts),
+					"advisor_context": advisor_context,
 					"cars_to_pitch":   sm_pitch,
 					"cars_to_suggest": sm_suggest,
 					"cars_with_relaxed_budget_to_pitch":   rb_pitch,
@@ -1241,18 +1283,12 @@ async def get_cars_according_to_user_specifications(
 				}
 
 			if model_found_above_budget and not alternatives_exist:
-				# Requested model exists but is over-budget, and no same-segment
-				# peers fit within the user's budget either.
 				rb_data    = model_at_any_price.get("data", [])
 				rb_pitch   = model_at_any_price.get("cars_to_pitch",   rb_data)
 				rb_suggest = model_at_any_price.get("cars_to_suggest", [])
 				return {
-					"next_action": (
-						f"{make_model_str} currently aapke budget mein available nahi hai. "
-						f"{make_model_str} ka starting price {starting_price} hai. "
-						f"Kya aap apna budget thoda badha sakte hain? "
-						f"If user agrees, pitch from cars_with_relaxed_budget_to_pitch."
-					),
+					"next_action":   " ".join(action_parts),
+					"advisor_context": advisor_context,
 					"cars_with_relaxed_budget_to_pitch":   rb_pitch,
 					"cars_with_relaxed_budget_to_suggest": rb_suggest,
 					"cars_with_relaxed_budget": {
@@ -1262,18 +1298,13 @@ async def get_cars_according_to_user_specifications(
 					},
 				}
 
-			# Requested model is not in inventory at all, but same-segment peers
-			# are available within the user's budget.
+			# Model not in inventory, but same-segment peers exist within budget.
 			sim_data   = similar_within_budget_result.get("data", [])
 			sm_pitch   = similar_within_budget_result.get("cars_to_pitch",   sim_data)
 			sm_suggest = similar_within_budget_result.get("cars_to_suggest", [])
 			return {
-				"next_action": (
-					f"{make_model_str} currently available nahi hai. "
-					f"But similar options jaise {available_make_models} aapke budget mein available hain. "
-					f"Ask the user if they would like to explore these similar options. "
-					f"If yes, pitch from cars_to_pitch using the default pitching logic."
-				),
+				"next_action":   " ".join(action_parts),
+				"advisor_context": advisor_context,
 				"cars_to_pitch":   sm_pitch,
 				"cars_to_suggest": sm_suggest,
 				"similar_model_cars_within_user_budget": {
