@@ -17,7 +17,7 @@ Default SUGGEST segments: A1, C2, D1, D2
 
 Usage (inside get_cars_according_to_user_specifications)
 ---------------------------------------------------------
-    from car_segments import get_car_segment_info, get_segment_for_budget
+    from car_segments import get_car_segment_info
 
     seg_info = get_car_segment_info(
         make=car["make"], model=car["model"], price=car["price"],
@@ -162,23 +162,7 @@ SEGMENT_META: dict[str, dict] = {
 }
 
 # ---------------------------------------------------------------------------
-# 4.  Budget-based routing  (used-car price in rupees)
-#     Returns which segment to PITCH and which to SUGGEST for a given budget.
-# ---------------------------------------------------------------------------
-_BUDGET_ROUTING: list[dict] = [
-    {"max_price":   300_000, "pitch": "A1", "suggest": "A2"},
-    {"max_price":   600_000, "pitch": "A2", "suggest": "B1"},
-    {"max_price":   900_000, "pitch": "B1", "suggest": "A2"},
-    {"max_price": 1_400_000, "pitch": "B2", "suggest": "C1"},
-    {"max_price": 2_000_000, "pitch": "C1", "suggest": "B2"},
-    {"max_price": 3_000_000, "pitch": "C2", "suggest": "C1"},
-    {"max_price": 5_000_000, "pitch": "D1", "suggest": "C2"},
-    {"max_price": float("inf"), "pitch": "D2", "suggest": "D1"},
-]
-
-
-# ---------------------------------------------------------------------------
-# 5.  Internal helpers
+# 4.  Internal helpers
 # ---------------------------------------------------------------------------
 
 def _segment_from_price(price_rupees: float) -> str:
@@ -199,7 +183,7 @@ def _segment_from_price(price_rupees: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 6.  Public API
+# 5.  Public API
 # ---------------------------------------------------------------------------
 
 def get_car_segment_info(
@@ -268,31 +252,6 @@ def get_car_segment_info(
         "pitch_script_hint":   meta["pitch_script_hint"],
         "examples":            meta["examples"],
     }
-
-
-def get_segment_for_budget(budget_rupees: float) -> dict:
-    """
-    Given a customer's budget, return the recommended PITCH and SUGGEST segments.
-
-    Example
-    -------
-        get_segment_for_budget(1_200_000)
-        # → {"pitch_segment": "B2", "suggest_segment": "C1", ...}
-    """
-    for route in _BUDGET_ROUTING:
-        if budget_rupees <= route["max_price"]:
-            pitch, suggest = route["pitch"], route["suggest"]
-            return {
-                "pitch_segment":        pitch,
-                "suggest_segment":      suggest,
-                "pitch_name":           SEGMENT_META[pitch]["name"],
-                "suggest_name":         SEGMENT_META[suggest]["name"],
-                "pitch_description":    SEGMENT_META[pitch]["description"],
-                "suggest_description":  SEGMENT_META[suggest]["description"],
-                "pitch_script_hint":    SEGMENT_META[pitch]["pitch_script_hint"],
-            }
-    # Should never reach here given float("inf") in the last route
-    return get_segment_for_budget(5_000_000)
 
 
 def build_pitch_instruction(car: dict) -> str:

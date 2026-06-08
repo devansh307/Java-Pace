@@ -78,27 +78,6 @@ SUGGEST →  Mention as an option only
 
 ---
 
-### Budget → Segment Routing
-
-The voice bot automatically determines which segment to pitch based on the customer's stated budget:
-
-| Budget | Primary PITCH | Fallback SUGGEST |
-|--------|--------------|-----------------|
-| < ₹3 lakh | A1 | A2 |
-| ₹3 – 6 lakh | A2 | B1 |
-| ₹6 – 9 lakh | B1 | A2 |
-| ₹9 – 14 lakh | B2 | C1 |
-| ₹14 – 20 lakh | **C1** | B2 |
-| ₹20 – 30 lakh | C2 | C1 |
-| ₹30 – 50 lakh | D1 | C2 |
-| > ₹50 lakh | D2 | D1 |
-
-> The overlap between B2 and C1 at the ₹10–14 lakh range is intentional.
-> When a customer doesn't specify body type, **default to C1** (SUV) — it has
-> both the highest demand and the best margins.
-
----
-
 ### Classification Logic (two-step)
 
 ```
@@ -116,7 +95,7 @@ The voice bot automatically determines which segment to pitch based on the custo
 
 | File | Purpose |
 |------|---------|
-| `car_segments.py` | Standalone module — all constants, `get_car_segment_info()`, `get_segment_for_budget()`, `build_pitch_instruction()` |
+| `car_segments.py` | Standalone module — all constants, `get_car_segment_info()`, `build_pitch_instruction()` |
 | `voice_bot_integration.py` | Step-by-step patch guide showing exactly which lines to add/change in `get_cars_according_to_user_specifications` |
 
 ---
@@ -125,7 +104,7 @@ The voice bot automatically determines which segment to pitch based on the custo
 
 #### Step 1 — Import at the top of the module
 ```python
-from car_segments import get_car_segment_info, get_segment_for_budget, SEGMENT_META
+from car_segments import get_car_segment_info, SEGMENT_META
 ```
 
 #### Step 2 — Add `_get_seg` helper inside `return_cars` (after the `SIMILAR_CARS` dict)

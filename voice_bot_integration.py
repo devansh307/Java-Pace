@@ -21,7 +21,6 @@ The actual logic lives in car_segments.py.
 
 from car_segments import (
     get_car_segment_info,
-    get_segment_for_budget,
     build_pitch_instruction,
     SEGMENT_VOICE_BOT_ACTION,
     SEGMENT_META,
@@ -127,38 +126,6 @@ new_car = {
 
 
 # ===========================================================================
-# CHANGE 4 (optional) — Segment-aware budget routing
-#
-# LOCATION: right at the beginning of get_cars_according_to_user_specifications,
-#           after the payload is assembled (around the ``payload = {…}`` block).
-#
-# This adds a top-level ``segment_routing`` key to every response so the
-# voice bot knows which segment to prioritise for this customer's budget.
-# ===========================================================================
-
-# After building the payload, compute budget-level routing once:
-_OPTIONAL_ROUTING = """
-# Segment routing for this customer's budget
-_budget_rupees = (
-    max_price * 100_000 if max_price and max_price < 10_000 else max_price or 0
-)
-_segment_routing = get_segment_for_budget(_budget_rupees) if _budget_rupees else {}
-"""
-
-# Then, in every return statement that contains a ``data`` key, add:
-#   "segment_routing": _segment_routing,
-#
-# Example (CASE 2 / pitch path):
-_RETURN_WITH_ROUTING = """
-return {
-    "next_action": "pitch available cars",
-    "segment_routing": _segment_routing,   # ← ADD THIS
-    **primary_result,
-}
-"""
-
-
-# ===========================================================================
 # FULL EXAMPLE OUTPUT
 #
 # After applying all changes, each car dict in ``data`` will look like:
@@ -192,14 +159,4 @@ EXAMPLE_CAR_OUTPUT = {
         "all-road capability. Quote EMI and current offer proactively. "
         "Always ask: 'Would you like to book a test drive?'"
     ),
-}
-
-EXAMPLE_SEGMENT_ROUTING = {
-    "pitch_segment":     "C1",
-    "suggest_segment":   "B2",
-    "pitch_name":        "Compact / Mid SUV",
-    "suggest_name":      "Mid Sedan",
-    "pitch_description": "India's fastest-moving used-car segment. ...",
-    "suggest_description": "Feature-rich full-size sedans for professionals ...",
-    "pitch_script_hint": "Lead every SUV conversation here ...",
 }
