@@ -40,12 +40,25 @@ async def get_cars_according_to_user_specifications(
 	Each arg should be in lower case.
 	"""
 	import asyncio
+	import os
+	import sys
 	from datetime import datetime
 	from math import radians, sin, cos, asin, sqrt
 	import httpx
 	import pytz
 	from num2words import num2words
 	from rapidfuzz import process, fuzz
+
+	# When this function is exec'd as a string by the LiveKit worker the
+	# caller's sys.path may not include the project root that contains the
+	# utils/ package.  Walk from cwd upward until we find the directory
+	# that owns utils/ and prepend it so the imports below succeed.
+	for _candidate in (os.getcwd(), os.path.dirname(os.getcwd())):
+		if os.path.isdir(os.path.join(_candidate, "utils")):
+			if _candidate not in sys.path:
+				sys.path.insert(0, _candidate)
+			break
+
 	from utils.city_wise_hubs import hubs_with_location
 	from utils.helpers import (
 		add_functions_called,
