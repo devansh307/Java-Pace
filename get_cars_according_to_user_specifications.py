@@ -1080,7 +1080,8 @@ async def get_cars_according_to_user_specifications(
 	# ──────────────────────────────────────────────────────────────────────────
 	# Phased drop order
 	# Phase 1:  drop ['hub','hub_id','rto','min_year','color','max_mileage']
-	# Phase 2:  SIMILAR_CARS competitor lookup (if model was specified)
+	# Phase 2:  Advisor fallback — check model at any price (report starting
+	#           price if over-budget) + find same-segment peers within budget
 	# Phase 3a: drop model entirely
 	# Phase 3b: drop make, owner, fuel_type, transmission, seats, body_type, max_price
 	# ──────────────────────────────────────────────────────────────────────────
@@ -1125,82 +1126,163 @@ async def get_cars_according_to_user_specifications(
 		if retry.get("count", 0) > 0:
 			return _relaxed_response(retry, dropped_keys)
 
-	# ── Phase 2: SIMILAR_CARS competitor lookup ────────────────────────────────
+	# ── Phase 2: Advisor fallback — model over-budget or unavailable ──────────
 	if "model" in primary_preferences:
 		lookup_make = original_make_norm or payload.get("make", "")
 		lookup_model = original_model_norm or payload.get("model", "")
 		make_model_str = f"{lookup_make} {lookup_model}".strip()
 
+		# ── 2a: Check if requested model exists at ANY price (no budget cap) ──
+		# The "with_extra_budget" function name causes ascending price sort, so
+		# data[0] will be the cheapest listing → the model's starting price.
+		model_at_any_price = None
+		if has_budget:
+			model_at_any_price = await return_cars(
+				ctx, {**relaxed_payload, "max_price": 0},
+				"get_cars_according_to_user_choice_with_extra_budget",
+				**prefer_kwargs,
+			)
+		model_found_above_budget = bool(
+			model_at_any_price and model_at_any_price.get("count", 0) > 0
+		)
+
+		# ── 2b: Find same-segment alternatives within the user's budget ────────
+		# Build the peer list from ALL models in SIMILAR_CARS that share the same
+		# segment code as the requested model — not just the 3 hardcoded options.
+		# This ensures alternatives are grouped by true car segment (a1–d2).
 		similar_row = get_similar_cars_row(make_model_str)
+		segment_peer_models = []
+		requested_segment_code = None
 		if similar_row:
 			logger.info(f"similar_row {similar_row}")
-			model_a = similar_row["Model Option A"]
-			model_b = similar_row["Model Option B"]
-			model_c = similar_row["Model Option C"]
-			model_search = ",".join(
-				m.lower().replace(" ", "-")
-				for m in (model_a, model_b, model_c) if m
-			)
-			logger.info(f"model_search {model_search}")
+			requested_segment_code = SEGMENT_CODE_MAP.get(similar_row.get("Segment", ""))
+			if requested_segment_code:
+				seen_peers: set = set()
+				for _key, _row in SIMILAR_CARS.items():
+					if SEGMENT_CODE_MAP.get(_row.get("Segment", "")) != requested_segment_code:
+						continue
+					peer_model = _row.get("Model", "")
+					peer_norm = _norm(peer_model)
+					if not peer_model or peer_norm == _norm(lookup_model):
+						continue
+					if peer_norm not in seen_peers:
+						segment_peer_models.append(peer_model)
+						seen_peers.add(peer_norm)
+			if not segment_peer_models:
+				# Fallback: use the 3 explicit competitor entries from SIMILAR_CARS
+				segment_peer_models = [
+					similar_row.get(f"Model Option {letter}", "")
+					for letter in ("A", "B", "C")
+				]
+		segment_peer_models = [m for m in segment_peer_models if m]
 
-			similar_model_results = await return_cars(
+		similar_within_budget_result = None
+		available_make_models = ""
+		if segment_peer_models:
+			peer_search = ",".join(
+				m.lower().replace(" ", "-") for m in segment_peer_models[:8]
+			)
+			logger.info(f"Segment peer search for {make_model_str} ({requested_segment_code if similar_row else 'unknown'}): {peer_search}")
+			similar_within_budget_result = await return_cars(
 				ctx,
-				{**relaxed_payload, "model": model_search, "make": ""},
+				{**relaxed_payload, "model": peer_search, "make": ""},
 				"check_model_availability",
 			)
-			if similar_model_results.get("count", 0) > 0:
-				similar_data = similar_model_results.get("data", [])
+			if similar_within_budget_result.get("count", 0) > 0:
+				sim_data = similar_within_budget_result.get("data", [])
 				available_make_models = ", ".join(
-					{f"{i['make']} {i['model']}" for i in similar_data}
+					sorted({f"{i['make']} {i['model']}" for i in sim_data})
 				)
-				relaxed_budget = await return_cars(
-					ctx, {**payload, "max_price": 0},
-					"get_cars_according_to_user_choice_with_extra_budget",
-					**prefer_kwargs,
-				)
-				sm_pitch   = similar_model_results.get("cars_to_pitch",   similar_data)
-				sm_suggest = similar_model_results.get("cars_to_suggest", [])
-				if relaxed_budget.get("count", 0) > 0:
-					rb_pitch   = relaxed_budget.get("cars_to_pitch",   relaxed_budget.get("data", []))
-					rb_suggest = relaxed_budget.get("cars_to_suggest", [])
-					msg = (
-						f'lowest option of {make_model_str} starts from {relaxed_budget["data"][0]["price"]}. '
-						f"Would you like to see cars in this range?"
-						f"also similar cars to {make_model_str} are available  "
-						f"like {available_make_models}, would you like to explore them?"
-					)
-					return {
-						"next_action": (
-							f"No cars found matching all of the user's specifications. "
-							f"However, found cars after relaxing the user's preferences. {msg}"
-						),
-						"similar_model_cars_to_pitch":   sm_pitch,
-						"similar_model_cars_to_suggest": sm_suggest,
-						"cars_with_relaxed_budget_to_pitch":   rb_pitch,
-						"cars_with_relaxed_budget_to_suggest": rb_suggest,
-						"similar_model_cars_within_user_budget": {
-							"existing_prefs_str": similar_model_results.get("existing_prefs_str", ""),
-							"additional_message": similar_model_results.get("additional_message", ""),
-							"data": similar_data,
-						},
-						"cars_with_relaxed_budget": {
-							"existing_prefs_str": relaxed_budget.get("existing_prefs_str", ""),
-							"additional_message": relaxed_budget.get("additional_message", ""),
-							"data": relaxed_budget.get("data", []),
-						},
-					}
+
+		alternatives_exist = bool(
+			similar_within_budget_result
+			and similar_within_budget_result.get("count", 0) > 0
+		)
+
+		# ── 2c: Advisor-style response ────────────────────────────────────────
+		if model_found_above_budget or alternatives_exist:
+			starting_price = (
+				model_at_any_price["data"][0]["price"]
+				if model_found_above_budget
+				else None
+			)
+
+			if model_found_above_budget and alternatives_exist:
+				# Requested model exists but is over the user's budget, AND
+				# same-segment alternatives are available within budget.
+				sim_data   = similar_within_budget_result.get("data", [])
+				sm_pitch   = similar_within_budget_result.get("cars_to_pitch",   sim_data)
+				sm_suggest = similar_within_budget_result.get("cars_to_suggest", [])
+				rb_data    = model_at_any_price.get("data", [])
+				rb_pitch   = model_at_any_price.get("cars_to_pitch",   rb_data)
+				rb_suggest = model_at_any_price.get("cars_to_suggest", [])
 				return {
 					"next_action": (
-						f"{make_model_str} not found. Ask if they would like to see other similar options like {available_make_models}"
+						f"{make_model_str} currently aapke budget mein available nahi hai. "
+						f"{make_model_str} ka starting price {starting_price} hai. "
+						f"Similar options jaise {available_make_models} aapke budget mein available hain. "
+						f"Ask the user if they would like to explore these similar options. "
+						f"If yes, pitch from cars_to_pitch using the default pitching logic."
 					),
-					"similar_model_cars_to_pitch":   sm_pitch,
-					"similar_model_cars_to_suggest": sm_suggest,
+					"cars_to_pitch":   sm_pitch,
+					"cars_to_suggest": sm_suggest,
+					"cars_with_relaxed_budget_to_pitch":   rb_pitch,
+					"cars_with_relaxed_budget_to_suggest": rb_suggest,
 					"similar_model_cars_within_user_budget": {
-						"existing_prefs_str": similar_model_results.get("existing_prefs_str", ""),
-						"additional_message": similar_model_results.get("additional_message", ""),
-						"data": similar_data,
+						"existing_prefs_str": similar_within_budget_result.get("existing_prefs_str", ""),
+						"additional_message": similar_within_budget_result.get("additional_message", ""),
+						"data": sim_data,
+					},
+					"cars_with_relaxed_budget": {
+						"existing_prefs_str": model_at_any_price.get("existing_prefs_str", ""),
+						"additional_message": model_at_any_price.get("additional_message", ""),
+						"data": rb_data,
 					},
 				}
+
+			if model_found_above_budget and not alternatives_exist:
+				# Requested model exists but is over-budget, and no same-segment
+				# peers fit within the user's budget either.
+				rb_data    = model_at_any_price.get("data", [])
+				rb_pitch   = model_at_any_price.get("cars_to_pitch",   rb_data)
+				rb_suggest = model_at_any_price.get("cars_to_suggest", [])
+				return {
+					"next_action": (
+						f"{make_model_str} currently aapke budget mein available nahi hai. "
+						f"{make_model_str} ka starting price {starting_price} hai. "
+						f"Kya aap apna budget thoda badha sakte hain? "
+						f"If user agrees, pitch from cars_with_relaxed_budget_to_pitch."
+					),
+					"cars_with_relaxed_budget_to_pitch":   rb_pitch,
+					"cars_with_relaxed_budget_to_suggest": rb_suggest,
+					"cars_with_relaxed_budget": {
+						"existing_prefs_str": model_at_any_price.get("existing_prefs_str", ""),
+						"additional_message": model_at_any_price.get("additional_message", ""),
+						"data": rb_data,
+					},
+				}
+
+			# Requested model is not in inventory at all, but same-segment peers
+			# are available within the user's budget.
+			sim_data   = similar_within_budget_result.get("data", [])
+			sm_pitch   = similar_within_budget_result.get("cars_to_pitch",   sim_data)
+			sm_suggest = similar_within_budget_result.get("cars_to_suggest", [])
+			return {
+				"next_action": (
+					f"{make_model_str} currently available nahi hai. "
+					f"But similar options jaise {available_make_models} aapke budget mein available hain. "
+					f"Ask the user if they would like to explore these similar options. "
+					f"If yes, pitch from cars_to_pitch using the default pitching logic."
+				),
+				"cars_to_pitch":   sm_pitch,
+				"cars_to_suggest": sm_suggest,
+				"similar_model_cars_within_user_budget": {
+					"existing_prefs_str": similar_within_budget_result.get("existing_prefs_str", ""),
+					"additional_message": similar_within_budget_result.get("additional_message", ""),
+					"data": sim_data,
+				},
+			}
+		# Neither the model nor any same-segment peer was found → Phase 3a
 
 	# ── Phase 3a: drop model entirely ─────────────────────────────────────────
 	if "model" in relaxed_payload:
