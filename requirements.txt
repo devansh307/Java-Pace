@@ -1,0 +1,6 @@
+# Core dependencies for car segment logic and car-search integration snippets.
+# Full voice-bot runtime (LiveKit Agents, utils/, etc.) lives in the parent project.
+rapidfuzz>=3.0.0
+httpx>=0.27.0
+pytz>=2024.1
+num2words>=0.5.13
