@@ -381,7 +381,7 @@ async def get_cars_according_to_user_specifications(
 	# return_cars — performs one API call, ranks/filters results.
 	# ──────────────────────────────────────────────────────────────────────────
 	async def return_cars(
-		ctx: "RunContext",
+		ctx,
 		payload: dict,
 		function_name: str,
 		diversify: bool = False,
@@ -400,9 +400,9 @@ async def get_cars_according_to_user_specifications(
 			payload.update({"model": "alto,alto-800,alto-k10"})
 
 		agent = ctx.session.current_agent
-		data = getattr(agent, "dial_info", {}) or {}
+		dial_info = getattr(agent, "dial_info", {}) or {}
 		job_ctx = get_job_context()
-		curr_prompt = data.get("system_prompt", False)
+		curr_prompt = dial_info.get("system_prompt", False)
 		if curr_prompt:
 			key_map = {"max_mileage": "max_km_driven"}
 			updated_prompt = curr_prompt
@@ -465,13 +465,13 @@ async def get_cars_according_to_user_specifications(
 		ist = pytz.timezone("Asia/Kolkata")
 		now_ist = datetime.now(ist)
 
-		def record(succ: bool, data=None):
+		def record(succ: bool, resp_data=None):
 			new_f = {
 				"name": function_name,
 				"parameters": payload,
 				"success": succ,
 				"timestamp": now_ist.isoformat(),
-				"response": data,
+				"response": resp_data,
 			}
 			add_functions_called(get_job_context(), new_f)
 
@@ -675,7 +675,7 @@ async def get_cars_according_to_user_specifications(
 
 				new_car = {
 					"car_lead_id": car.get("id", ""),
-					"make_year": year_to_words(car.get("registration_year", 0), data.get("default_language", "en")),
+					"make_year": year_to_words(car.get("registration_year", 0), dial_info.get("default_language", "en")),
 					"make": convert_to_words(car_make_raw),
 					"model": convert_to_words(car_model_raw.replace("Dzire", "डिज़ायर")),
 					"variant": convert_to_words(car.get("variant", "")),
