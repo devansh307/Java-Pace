@@ -37,8 +37,8 @@ class AdvisorFallbackTests(unittest.TestCase):
         self.assertEqual(result.status, "over_budget_with_similar")
         self.assertEqual(result.requested_starting_price, 625000)
         self.assertEqual([car.lead_id for car in result.similar_options], ["baleno", "altroz"])
-        self.assertIn("i20 is unavailable in the user's budget", result.message)
-        self.assertIn("i20 starts from 6.25 lakh", result.message)
+        self.assertIn("i20 current budget mein available nahi hai", result.message)
+        self.assertIn("i20 ka starting price six lakh twenty five thousand hai", result.message)
         self.assertIn("Baleno, Altroz", result.message)
 
     def test_suggests_segment_options_when_requested_model_is_missing(self):
@@ -56,7 +56,7 @@ class AdvisorFallbackTests(unittest.TestCase):
 
         self.assertEqual(result.status, "unavailable_with_similar")
         self.assertEqual([car.lead_id for car in result.similar_options], ["baleno", "altroz"])
-        self.assertIn("Currently i20 is unavailable", result.message)
+        self.assertIn("Currently i20 available nahi hai", result.message)
         self.assertIn("Baleno, Altroz", result.message)
 
     def test_uses_aliases_for_requested_model_and_alternatives(self):

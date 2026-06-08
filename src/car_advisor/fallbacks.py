@@ -118,15 +118,15 @@ def build_advisor_recommendation(
     if requested_starting_price is not None:
         if similar_options:
             message = (
-                f"{_display(requested)} is unavailable in the user's budget. "
-                f"{_display(requested)} starts from {_format_price(requested_starting_price)}. "
-                f"Similar options available in budget: {_join_models(similar_options)}."
+                f"{_display(requested)} current budget mein available nahi hai. "
+                f"{_display(requested)} ka starting price {_format_price(requested_starting_price)} hai. "
+                f"Similar options mein {_join_models(similar_options)} available hain."
             )
             status = "over_budget_with_similar"
         else:
             message = (
-                f"{_display(requested)} is unavailable in the user's budget. "
-                f"{_display(requested)} starts from {_format_price(requested_starting_price)}."
+                f"{_display(requested)} current budget mein available nahi hai. "
+                f"{_display(requested)} ka starting price {_format_price(requested_starting_price)} hai."
             )
             status = "over_budget"
         return AdvisorRecommendation(
@@ -140,8 +140,8 @@ def build_advisor_recommendation(
         return AdvisorRecommendation(
             status="unavailable_with_similar",
             message=(
-                f"Currently {_display(requested)} is unavailable. "
-                f"Similar options available: {_join_models(similar_options)}."
+                f"Currently {_display(requested)} available nahi hai. "
+                f"Similar options mein {_join_models(similar_options)} available hain."
             ),
             similar_options=similar_options,
         )
@@ -149,8 +149,8 @@ def build_advisor_recommendation(
     return AdvisorRecommendation(
         status="unavailable",
         message=(
-            f"Currently {_display(requested)} is unavailable, and no close segment "
-            "alternatives are available in the current inventory."
+            f"Currently {_display(requested)} available nahi hai, aur close segment "
+            "alternatives bhi current inventory mein available nahi hain."
         ),
     )
 
@@ -235,12 +235,82 @@ def _display(model: str) -> str:
 
 
 def _format_price(price: int) -> str:
-    if price >= 100000:
-        lakh_value = price / 100000
-        if lakh_value.is_integer():
-            return f"{int(lakh_value)} lakh"
-        return f"{lakh_value:.2f}".rstrip("0").rstrip(".") + " lakh"
-    return str(price)
+    rounded_price = int(round(price / 1000) * 1000)
+    return _number_to_words_indian(rounded_price)
+
+
+def _number_to_words_indian(value: int) -> str:
+    if value == 0:
+        return "zero"
+
+    parts: list[str] = []
+    lakh, remainder = divmod(value, 100000)
+    thousand, remainder = divmod(remainder, 1000)
+    hundred, remainder = divmod(remainder, 100)
+
+    if lakh:
+        parts.append(f"{_number_under_1000_to_words(lakh)} lakh")
+    if thousand:
+        parts.append(f"{_number_under_1000_to_words(thousand)} thousand")
+    if hundred:
+        parts.append(f"{_number_under_1000_to_words(hundred)} hundred")
+    if remainder:
+        parts.append(_number_under_100_to_words(remainder))
+
+    return " ".join(parts)
+
+
+def _number_under_1000_to_words(value: int) -> str:
+    hundred, remainder = divmod(value, 100)
+    parts: list[str] = []
+    if hundred:
+        parts.append(f"{_number_under_100_to_words(hundred)} hundred")
+    if remainder:
+        parts.append(_number_under_100_to_words(remainder))
+    return " ".join(parts)
+
+
+def _number_under_100_to_words(value: int) -> str:
+    units = (
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+    )
+    tens = (
+        "",
+        "",
+        "twenty",
+        "thirty",
+        "forty",
+        "fifty",
+        "sixty",
+        "seventy",
+        "eighty",
+        "ninety",
+    )
+    if value < 20:
+        return units[value]
+    ten, unit = divmod(value, 10)
+    if unit:
+        return f"{tens[ten]} {units[unit]}"
+    return tens[ten]
 
 
 def _join_models(cars: Sequence[CarListing]) -> str:

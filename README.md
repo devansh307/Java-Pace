@@ -26,7 +26,7 @@ result = build_advisor_recommendation(
 print(result.message)
 ```
 
-For an i20 request with a five lakh budget, if i20 starts at six point two five
-lakh and Baleno/Altroz are available in budget, the helper returns:
+For an i20 request with a five lakh budget, if i20 starts at six lakh twenty
+five thousand and Baleno/Altroz are available in budget, the helper returns:
 
-`i20 is unavailable in the user's budget. i20 starts from 6.25 lakh. Similar options available in budget: Baleno, Altroz.`
+`i20 current budget mein available nahi hai. i20 ka starting price six lakh twenty five thousand hai. Similar options mein Baleno, Altroz available hain.`
