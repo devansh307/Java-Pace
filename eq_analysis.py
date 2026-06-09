@@ -1,6 +1,7 @@
 """
 EQ (Emotional Intelligence) Behavior Analysis of Call Transcripts
 Analyzes Spinny AI assistant conversations for emotional intelligence dimensions.
+Filter: Jaipur calls only.
 """
 
 import pandas as pd
@@ -247,9 +248,18 @@ def get_observations(scored_row: dict) -> list[str]:
 
 # ── Main analysis ─────────────────────────────────────────────────────────────
 
+CITY_FILTER = "Jaipur"   # set to None to include all cities
+
+
 def main():
     df = pd.read_csv(CSV_PATH)
-    print(f"Loaded {len(df)} calls.")
+    if CITY_FILTER:
+        df = df[df['city'].str.strip().str.lower() == CITY_FILTER.lower()].reset_index(drop=True)
+        print(f"Loaded {len(df)} calls (filtered to {CITY_FILTER}).")
+    else:
+        print(f"Loaded {len(df)} calls (all cities).")
+
+    city_label = CITY_FILTER if CITY_FILTER else "All Cities"
 
     results = [score_call(row) for _, row in df.iterrows()]
     scores_df = pd.DataFrame(results)
@@ -267,7 +277,7 @@ def main():
         'empathy_score', 'apology_score', 'active_listening_score',
         'patience_score', 'adaptability_score', 'rapport_score', 'eq_composite'
     ]
-    print("\n=== ASSISTANT EQ DIMENSION AVERAGES (0-10 scale) ===")
+    print(f"\n=== ASSISTANT EQ DIMENSION AVERAGES — {city_label} (0-10 scale) ===")
     for dim in eq_dims:
         print(f"  {dim:<30} {scores_df[dim].mean():.2f}  "
               f"(min {scores_df[dim].min():.1f}, max {scores_df[dim].max():.1f})")
@@ -309,7 +319,7 @@ def main():
     ax.set_ylim(0, 10)
     ax.set_yticks([2, 4, 6, 8, 10])
     ax.set_yticklabels(['2', '4', '6', '8', '10'], size=8)
-    ax.set_title('Assistant EQ Dimensions\n(Average across all calls)', size=13, pad=20)
+    ax.set_title(f'Assistant EQ Dimensions — {city_label}\n(Average across all calls)', size=13, pad=20)
     plt.tight_layout()
     radar_path = os.path.join(ARTIFACTS_DIR, "eq_radar.png")
     plt.savefig(radar_path, dpi=150, bbox_inches='tight')
@@ -327,7 +337,7 @@ def main():
     ax.set_xticks(range(len(scores_df)))
     ax.set_xticklabels([str(b) for b in scores_df['buylead']], rotation=45, ha='right', size=7)
     ax.set_ylabel('Composite EQ Score (0–10)', size=11)
-    ax.set_title('Composite EQ Score per Call', size=13)
+    ax.set_title(f'Composite EQ Score per Call — {city_label}', size=13)
     ax.set_ylim(0, 10)
     ax.legend(fontsize=10)
     legend_patches = [
@@ -366,7 +376,7 @@ def main():
         ax.set_title(title, size=11)
         ax.set_ylim(0, 10)
 
-    plt.suptitle('Customer Emotions vs. Assistant EQ Composite', size=13, y=1.02)
+    plt.suptitle(f'Customer Emotions vs. Assistant EQ Composite — {city_label}', size=13, y=1.02)
     plt.tight_layout()
     scatter_path = os.path.join(ARTIFACTS_DIR, "eq_emotion_scatter.png")
     plt.savefig(scatter_path, dpi=150, bbox_inches='tight')
@@ -380,7 +390,7 @@ def main():
     fig, ax = plt.subplots(figsize=(12, 10))
     sns.heatmap(heat_df.astype(float), annot=True, fmt='.1f', cmap='RdYlGn',
                 vmin=0, vmax=10, linewidths=0.5, ax=ax, cbar_kws={'label': 'Score (0–10)'})
-    ax.set_title('EQ Dimension Heatmap per Call (by buylead)', size=13)
+    ax.set_title(f'EQ Dimension Heatmap per Call — {city_label}', size=13)
     ax.set_xlabel('EQ Dimension', size=11)
     ax.set_ylabel('Buylead', size=11)
     plt.tight_layout()
@@ -389,19 +399,19 @@ def main():
     plt.close()
     print(f"Saved → {heat_path}")
 
-    # 5. EQ by city (grouped bar)
-    city_eq = scores_df.groupby('city')[raw_dims].mean().round(2)
-    fig, ax = plt.subplots(figsize=(12, 6))
-    city_eq.plot(kind='bar', ax=ax, colormap='tab10', edgecolor='white')
-    ax.set_title('Average EQ Dimensions by City', size=13)
+    # 5. EQ by capability type (sql vs sql_followup) — replaces city chart when filtered
+    cap_eq = scores_df.groupby('capability')[raw_dims].mean().round(2)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    cap_eq.plot(kind='bar', ax=ax, colormap='tab10', edgecolor='white')
+    ax.set_title(f'Average EQ Dimensions by Call Type — {city_label}', size=13)
     ax.set_ylabel('Score (0–10)', size=11)
-    ax.set_xlabel('City', size=11)
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right')
+    ax.set_xlabel('Call Type', size=11)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=0)
     ax.legend(['Empathy', 'Apology', 'Active Listening', 'Patience',
                'Adaptability', 'Rapport'], loc='upper right', fontsize=8)
     ax.set_ylim(0, 10)
     plt.tight_layout()
-    city_path = os.path.join(ARTIFACTS_DIR, "eq_by_city.png")
+    city_path = os.path.join(ARTIFACTS_DIR, "eq_by_calltype.png")
     plt.savefig(city_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Saved → {city_path}")
@@ -414,7 +424,7 @@ def main():
                linewidth=2, label=f"Mean = {scores_df['eq_composite'].mean():.2f}")
     ax.axvline(scores_df['eq_composite'].median(), color='#2ecc71', linestyle='-.',
                linewidth=2, label=f"Median = {scores_df['eq_composite'].median():.2f}")
-    ax.set_title('Distribution of Composite EQ Score', size=13)
+    ax.set_title(f'Distribution of Composite EQ Score — {city_label}', size=13)
     ax.set_xlabel('EQ Composite Score (0–10)', size=11)
     ax.set_ylabel('Count', size=11)
     ax.legend(fontsize=10)
@@ -441,7 +451,7 @@ def main():
                     fontsize=6, alpha=0.6)
     ax.set_xlabel('Call Duration (seconds)', size=11)
     ax.set_ylabel('EQ Composite Score', size=11)
-    ax.set_title('Call Duration vs. EQ Composite', size=13)
+    ax.set_title(f'Call Duration vs. EQ Composite — {city_label}', size=13)
     ax.legend(fontsize=9)
     plt.tight_layout()
     dur_path = os.path.join(ARTIFACTS_DIR, "eq_duration_scatter.png")
@@ -484,7 +494,7 @@ def main():
     print(f"\n  Calls with positive closing: {pos_close}/{len(scores_df)} ({pos_close/len(scores_df)*100:.0f}%)")
 
     # sql vs sql_followup comparison
-    print("\n  EQ by call type (capability):")
+    print(f"\n  EQ by call type (capability) — {city_label}:")
     cap_group = scores_df.groupby('capability')['eq_composite'].agg(['mean', 'count'])
     for cap, row in cap_group.iterrows():
         print(f"    {cap}: mean EQ = {row['mean']:.2f}  (n={int(row['count'])})")
