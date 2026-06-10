@@ -7,12 +7,12 @@ Already-known items (ambiguity gate, CIBIL consent, TD context, `<thinking>` lea
 
 ## Transcript 1 (TDC → car unavailable → sql_followup pitch)
 
-### T1-A. State collision: two contradictory call contexts in back-to-back turns ⚠️ CRITICAL
+### T1-A. State collision: two contradictory call contexts in back-to-back turns ⚠️ CRITICAL (Now_RESOLVED) (PROMPT UPDATED ABOVE CALL FLOW)
 Turn 3: *"आपकी test drive **9 जून पांच बजे** के लिए scheduled थी, पर वो कार available नहीं है, किसी और ने book कर ली"* (car-unavailable script).
 Turn 5: *"आपकी test drive **आज** scheduled थी, लेकिन आप hub नहीं आ पाए — सब ठीक है ना?"* (no-show recovery script).
 Two different TDC branches fired with two different dates and two different premises. **This collision is very likely the real trigger of the customer's "नई पुरानी?" confusion** — he was trying to figure out which conversation he was in. The ambiguity-gate patch treats the symptom; the state machine must pick exactly one branch (car-unavailable supersedes no-show) and never re-greet.
 
-### T1-B. Phantom-context interleaving
+### T1-B. Phantom-context interleaving (Now_RESOLVED) (PROMPT UPDATED ABOVE CALL FLOW)
 After the customer already said "दिखा दो" (show similar cars), the bot ignored that acceptance and jumped to the no-show script. Customer acceptance of a branch must lock the flow.
 
 ### T1-C. "Spinny Spinny Park" — hub-name template duplication
